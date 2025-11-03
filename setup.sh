@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
-# setup.sh - Kali VM installer/manager for MACCDC simulation (web + db) for CDCWebSim
+# setup.sh - All-in-one Kali setup for CDCWebSim (MACCDC sim: web + db)
+# - Repairs apt mirror & GPG keys (NO_PUBKEY), retries downloads
+# - Installs Postgres, Nginx, Python venv toolchain, build deps
+# - Clones/updates public repo cobaltsixd/CDCWebSim (no creds), ZIP fallback
+# - Creates venv, installs requirements (+ ensures gunicorn)
+# - Creates Postgres role+DB, writes .env
+# - Installs systemd unit for gunicorn, nginx reverse proxy
 #
 # Usage (run as root/sudo):
 #   sudo ./setup.sh install-all
@@ -9,24 +15,40 @@
 #   sudo ./setup.sh stop-all
 #   sudo ./setup.sh status
 #   sudo ./setup.sh help
-#
-# Idempotent-ish: safe to re-run. No GitHub credential prompts (HTTPS only; ZIP fallback).
 
 set -euo pipefail
 
-### === CONFIG (adjust if needed) ===
-REPO_HTTPS="https://github.com/cobaltsixd/CDCWebSim.git"
+export DEBIAN_FRONTEND=noninteractive
+export GIT_TERMINAL_PROMPT=0
+APT_RETRIES="-o Acquire::Retries=3"
+APT_FIX="--fix-missing"
+
+# -------- Config (override via env if needed) --------
+REPO_HTTPS="${REPO_HTTPS:-https://github.com/cobaltsixd/CDCWebSim.git}"
 BRANCH="${BRANCH:-main}"
 
-APP_USER="ctfsvc"
-APP_GROUP="ctfsvc"
-APP_BASE="/opt/maccdc"             # repo root on disk
-APP_DIR_CANDIDATES=("app" ".")     # auto-detect app dir: try 'app', then repo root
-VENV_DIR_NAME="venv"
-APP_PORT="${APP_PORT:-8000}"       # gunicorn binds here (localhost)
-NGINX_SITE_NAME="maccdc"
+APP_USER="${APP_USER:-ctfsvc}"
+APP_GROUP="${APP_GROUP:-ctfsvc}"
 
-# Database (override via env before running if you want fixed creds)
+# APP_BASE auto-detect:
+#  - if running inside a git repo, default to PWD
+#  - else fallback to /opt/maccdc
+detect_app_base() {
+  if [ -d ".git" ] || [ -f "requirements.txt" ] || [ -f "manage.py" ] || [ -f "wsgi.py" ] || [ -f "app.py" ]; then
+    echo "$(pwd)"
+  else
+    echo "/opt/maccdc"
+  fi
+}
+APP_BASE="${APP_BASE:-$(detect_app_base)}"
+
+# Try common app layouts: repo root or ./app
+APP_DIR_CANDIDATES=("app" ".")
+VENV_DIR_NAME="venv"
+
+APP_PORT="${APP_PORT:-8000}"
+NGINX_SITE_NAME="${NGINX_SITE_NAME:-maccdc}"
+
 DB_NAME="${DB_NAME:-maccdc}"
 DB_USER="${DB_USER:-maccdc}"
 DB_PASS="${DB_PASS:-$(openssl rand -base64 20)}"
@@ -35,23 +57,59 @@ DB_PORT=5432
 
 WEB_SERVICE="ctf-web.service"
 
-export DEBIAN_FRONTEND=noninteractive
-export GIT_TERMINAL_PROMPT=0
-
-### === Helpers ===
-log() { echo -e "\e[1;32m[setup]\e[0m $*"; }
+# -------- Utils --------
+log()  { echo -e "\e[1;32m[setup]\e[0m $*"; }
 info() { echo -e "\e[1;34m[info]\e[0m $*"; }
 warn() { echo -e "\e[1;33m[warn]\e[0m $*"; }
-err() { echo -e "\e[1;31m[error]\e[0m $*" >&2; }
+err()  { echo -e "\e[1;31m[error]\e[0m $*" >&2; }
 
 require_root() {
-  if [ "$(id -u)" -ne 0 ]; then
-    err "Run as root (sudo)."; exit 2
-  fi
+  if [ "$(id -u)" -ne 0 ]; then err "Run as root (sudo)."; exit 2; fi
 }
 
 command_exists() { command -v "$1" >/dev/null 2>&1; }
 
+# -------- APT repair & package install --------
+fix_kali_sources_and_key() {
+  log "Repairing Kali sources list to official mirror..."
+  cat >/etc/apt/sources.list <<'EOF'
+deb http://http.kali.org/kali kali-rolling main non-free non-free-firmware contrib
+EOF
+
+  # Ensure HTTPS CA bundle
+  apt-get update -y $APT_RETRIES $APT_FIX || true
+  apt-get install -y ca-certificates curl gnupg $APT_RETRIES $APT_FIX || true
+
+  # Try to install the official keyring package first
+  if ! dpkg -s kali-archive-keyring >/dev/null 2>&1; then
+    warn "Installing kali-archive-keyring package (to fix NO_PUBKEY)..."
+    apt-get update -y $APT_RETRIES $APT_FIX || true
+    if ! apt-get install -y kali-archive-keyring $APT_RETRIES $APT_FIX; then
+      warn "Keyring package install failed. Importing key manually..."
+      mkdir -p /usr/share/keyrings /etc/apt/keyrings /root/.gnupg
+      chmod 700 /root/.gnupg || true
+      curl -fsSL https://archive.kali.org/archive-key.asc | gpg --dearmor >/usr/share/keyrings/kali-archive-keyring.gpg || true
+      # Fallback to legacy apt-key (deprecated but works on Kali)
+      curl -fsSL https://archive.kali.org/archive-key.asc | apt-key add - || true
+    fi
+  fi
+
+  # Final update pass (allow Release info changes between weeklies)
+  apt-get -o Acquire::Retries=3 -o Acquire::Check-Valid-Until=false update -y || true
+}
+
+apt_install_safe() {
+  local pkgs=("$@")
+  apt-get update -y $APT_RETRIES $APT_FIX || true
+  if ! apt-get install -y "${pkgs[@]}" $APT_RETRIES $APT_FIX; then
+    warn "First apt install attempt failed. Cleaning and retrying..."
+    apt-get clean
+    apt-get update -y -o Acquire::Retries=5 --allow-releaseinfo-change $APT_FIX || true
+    apt-get install -y "${pkgs[@]}" $APT_RETRIES $APT_FIX
+  fi
+}
+
+# -------- System prep --------
 ensure_user() {
   if ! id -u "$APP_USER" >/dev/null 2>&1; then
     log "Creating system user: $APP_USER"
@@ -67,33 +125,25 @@ ensure_dirs() {
 }
 
 ensure_packages() {
-  log "Updating apt metadata and installing dependencies..."
-  apt-get update -y
-  apt-get install -y \
-    git curl rsync ca-certificates \
-    build-essential python3 python3-venv python3-pip python3-dev pkg-config \
-    nginx postgresql postgresql-contrib libpq-dev \
-    openssl
-  # Keep Python tooling fresh
+  log "Ensuring base toolchain and services..."
+  fix_kali_sources_and_key
+  apt_install_safe git curl rsync build-essential \
+    python3 python3-venv python3-pip python3-dev pkg-config \
+    nginx postgresql postgresql-contrib libpq-dev openssl
+  # Freshen pip globally (safe)
   python3 -m pip install --upgrade pip setuptools wheel >/dev/null 2>&1 || true
 }
 
-# Auto-detect app dir (repo root vs ./app)
+# -------- Repo handling --------
 APP_PATH="" ; VENV_PATH=""
 resolve_app_path() {
   for cand in "${APP_DIR_CANDIDATES[@]}"; do
-    if [ "$cand" = "." ]; then
-      local path="$APP_BASE"
-    else
-      local path="$APP_BASE/$cand"
-    fi
-    # Heuristics: has requirements.txt or a common entrypoint
+    local path
+    if [ "$cand" = "." ]; then path="$APP_BASE"; else path="$APP_BASE/$cand"; fi
     if [ -d "$path" ] && { [ -f "$path/requirements.txt" ] || [ -f "$path/manage.py" ] || [ -f "$path/wsgi.py" ] || [ -f "$path/app.py" ] || [ -f "$path/run.py" ]; }; then
-      APP_PATH="$path"
-      break
+      APP_PATH="$path"; break
     fi
   done
-  # fallback to repo root
   if [ -z "$APP_PATH" ]; then APP_PATH="$APP_BASE"; fi
   VENV_PATH="$APP_PATH/$VENV_DIR_NAME"
 }
@@ -102,17 +152,16 @@ clone_or_update_repo() {
   local tar_url="https://github.com/cobaltsixd/CDCWebSim/archive/refs/heads/${BRANCH}.tar.gz"
 
   if [ ! -d "$APP_BASE/.git" ]; then
-    log "Cloning public repo (no creds): $REPO_HTTPS -> $APP_BASE (branch $BRANCH)"
+    log "Cloning $REPO_HTTPS -> $APP_BASE (branch $BRANCH)"
     rm -rf "$APP_BASE" && mkdir -p "$APP_BASE"
     if git clone --branch "$BRANCH" --depth 1 "$REPO_HTTPS" "$APP_BASE"; then
       :
     else
-      warn "git clone failed; falling back to ZIP snapshot..."
+      warn "git clone failed; using ZIP snapshot..."
       curl -L "$tar_url" | tar xz -C "$APP_BASE" --strip-components=1
     fi
   else
     log "Updating existing repo in $APP_BASE..."
-    # force remote to HTTPS (avoid SSH)
     git -C "$APP_BASE" remote set-url origin "$REPO_HTTPS" || true
     if git -C "$APP_BASE" fetch --all --prune && git -C "$APP_BASE" reset --hard "origin/$BRANCH"; then
       :
@@ -128,6 +177,7 @@ clone_or_update_repo() {
   chown -R "$APP_USER":"$APP_GROUP" "$APP_BASE"
 }
 
+# -------- Python env --------
 create_python_venv() {
   resolve_app_path
   if [ ! -d "$VENV_PATH" ]; then
@@ -144,8 +194,15 @@ create_python_venv() {
   else
     warn "No requirements.txt at $APP_PATH/requirements.txt — skipping pip install."
   fi
+
+  # Ensure gunicorn is present even if not listed
+  if ! sudo -u "$APP_USER" bash -lc "source '$VENV_PATH/bin/activate' && python -c 'import gunicorn' 2>/dev/null"; then
+    log "Installing gunicorn (not found in venv)..."
+    sudo -u "$APP_USER" bash -lc "source '$VENV_PATH/bin/activate' && pip install gunicorn"
+  fi
 }
 
+# -------- Postgres --------
 setup_postgres() {
   log "Ensuring PostgreSQL is enabled and running..."
   systemctl enable --now postgresql
@@ -176,6 +233,7 @@ EOF
   chmod 640 "$envfile"
 }
 
+# -------- App detection --------
 detect_app_type() {
   resolve_app_path
   if [ -f "$APP_PATH/manage.py" ]; then
@@ -187,10 +245,11 @@ detect_app_type() {
   fi
 }
 
+# -------- systemd & nginx --------
 write_systemd_web_unit() {
   resolve_app_path
   local unit="/etc/systemd/system/$WEB_SERVICE"
-  local wsgi_module="wsgi:app"  # default guess
+  local wsgi_module="wsgi:app"
   local app_type; app_type="$(detect_app_type)"
 
   if [ "$app_type" = "django" ]; then
@@ -229,7 +288,6 @@ LimitNOFILE=65536
 [Install]
 WantedBy=multi-user.target
 EOF
-
   systemctl daemon-reload
   systemctl enable "$WEB_SERVICE"
   chown root:root "$unit"
@@ -276,7 +334,6 @@ run_app_db_setup() {
       sudo -u "$APP_USER" bash -lc "source '$VENV_PATH/bin/activate' && cd '$APP_PATH' && python manage.py collectstatic --noinput" || true
     fi
   else
-    # Convention: if your repo has scripts/db_setup.sh or db_init.sh, run it
     if [ -x "$APP_PATH/scripts/db_setup.sh" ]; then
       sudo -u "$APP_USER" bash -lc "cd '$APP_PATH' && scripts/db_setup.sh"
     elif [ -x "$APP_PATH/db_init.sh" ]; then
@@ -305,18 +362,15 @@ Database:
   host:         ${DB_HOST}
   port:         ${DB_PORT}
 
-Useful commands:
+Useful:
   sudo ./setup.sh status
-  sudo ./setup.sh start-web
-  sudo ./setup.sh stop-all
-Logs:
   journalctl -u ${WEB_SERVICE} -f
   tail -f /var/log/nginx/${NGINX_SITE_NAME}.error.log
 =============================================
 EOF
 }
 
-# ---- Public subcommands ----
+# -------- Public commands --------
 do_install_all() {
   require_root
   ensure_user
@@ -365,11 +419,10 @@ do_stop_all() {
   require_root
   systemctl stop "$WEB_SERVICE" || true
   systemctl stop nginx || true
-  info "Stopped web and nginx (postgres kept running)."
+  info "Stopped web and nginx (postgres left running)."
 }
 
 do_status() {
-  resolve_app_path
   echo "----- ${WEB_SERVICE} -----"
   systemctl status "$WEB_SERVICE" --no-pager || true
   echo "----- nginx -----"
@@ -383,21 +436,21 @@ do_status() {
 }
 
 show_help() {
-  sed -n '1,60p' "$0" | sed 's/^# \{0,1\}//' | sed '/^set -euo pipefail/,$d'
+  sed -n '1,80p' "$0" | sed 's/^# \{0,1\}//' | sed '/^set -euo pipefail/,$d'
   cat <<'EOF'
 
 Environment overrides:
-  BRANCH, APP_PORT, DB_NAME, DB_USER, DB_PASS
+  REPO_HTTPS, BRANCH, APP_BASE, APP_PORT, DB_NAME, DB_USER, DB_PASS, APP_USER, APP_GROUP
 
 Examples:
   sudo DB_PASS="classroom!" ./setup.sh install-all
+  sudo APP_BASE="$(pwd)" ./setup.sh install-all
   sudo ./setup.sh start-everything
   sudo ./setup.sh status
-
 EOF
 }
 
-# ---- Main ----
+# -------- Main --------
 case "${1:-help}" in
   install-all)        do_install_all ;;
   start-db)           do_start_db ;;
