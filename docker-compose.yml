@@ -1,0 +1,20 @@
+version: '3.8'
+services:
+  target:
+    image: python:3.11-slim
+    container_name: maccdc-target
+    volumes:
+      - ./target/app:/app
+    working_dir: /app
+    ports:
+      - "8080:80"
+    command: bash -c "pip install -r requirements.txt && gunicorn --bind 0.0.0.0:80 app:app"
+  scoreboard:
+    image: python:3.11-slim
+    container_name: maccdc-scoreboard
+    volumes:
+      - ./scoreboard:/scoreboard
+    working_dir: /scoreboard
+    command: bash -c "pip install requests mysql-connector-python && python3 score_poller.py"
+    depends_on:
+      - target
