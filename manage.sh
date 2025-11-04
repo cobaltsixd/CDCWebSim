@@ -1,138 +1,116 @@
 #!/usr/bin/env bash
-# manage.sh - Orchestrator for CDCWebSim role setups on Kali
-# Drives: setup-scoreboard.sh, setup-target.sh, setup-attacker.sh
+# manage.sh - Orchestrator for CDCWebSim role setups on Kali (safe /opt paths)
 
 set -euo pipefail
 
-# --- Settings you can override via env if needed ---
-APP_BASE_DEFAULT="$(pwd)"   # repo root by default
+# Root where each role will live (can override with BASE_ROOT=/some/path)
+BASE_ROOT="${BASE_ROOT:-/opt/maccdc}"
+
+# Setup script paths (relative to where you run manage.sh)
 SCOREBOARD_SCRIPT="${SCOREBOARD_SCRIPT:-./setup-scoreboard.sh}"
 TARGET_SCRIPT="${TARGET_SCRIPT:-./setup-target.sh}"
 ATTACKER_SCRIPT="${ATTACKER_SCRIPT:-./setup-attacker.sh}"
 
-# Optional per-role subdirs (if your code for each role lives in subfolders)
+SCOREBOARD_BASE="${SCOREBOARD_BASE:-$BASE_ROOT/scoreboard}"
+TARGET_BASE="${TARGET_BASE:-$BASE_ROOT/target}"
+ATTACKER_BASE="${ATTACKER_BASE:-$BASE_ROOT/attacker}"
+
 SCOREBOARD_SUBDIR="${SCOREBOARD_SUBDIR:-}"
 TARGET_SUBDIR="${TARGET_SUBDIR:-}"
 ATTACKER_SUBDIR="${ATTACKER_SUBDIR:-}"
 
 is_root(){ [ "$(id -u)" -eq 0 ]; }
-
 need_scripts(){
-  local missing=0
+  local ok=1
   for f in "$SCOREBOARD_SCRIPT" "$TARGET_SCRIPT" "$ATTACKER_SCRIPT"; do
-    if [ ! -f "$f" ]; then
-      echo "[manage] missing: $f" >&2
-      missing=1
-    fi
+    [ -f "$f" ] || { echo "[manage] missing: $f" >&2; ok=0; }
   done
-  [ "$missing" -eq 0 ]
+  return $ok
 }
-
-make_exec(){
-  chmod +x "$SCOREBOARD_SCRIPT" "$TARGET_SCRIPT" "$ATTACKER_SCRIPT" 2>/dev/null || true
-}
+make_exec(){ chmod +x "$SCOREBOARD_SCRIPT" "$TARGET_SCRIPT" "$ATTACKER_SCRIPT" 2>/dev/null || true; }
 
 run_role(){
-  # $1 = role name (scoreboard|target|attacker)
-  # $2 = command for the role script (install-all|start-everything|start-web|start-db|stop-all|status)
-  # $3 = optional APP_SUBDIR
-  local role="$1" cmd="$2" subdir="${3:-}"
-  local script
+  local role="$1" cmd="$2" base="$3" subdir="${4:-}" script
   case "$role" in
     scoreboard) script="$SCOREBOARD_SCRIPT" ;;
     target)     script="$TARGET_SCRIPT" ;;
     attacker)   script="$ATTACKER_SCRIPT" ;;
     *) echo "[manage] unknown role: $role" >&2; exit 2 ;;
   esac
-
-  local APP_BASE="${APP_BASE:-$APP_BASE_DEFAULT}"
-  # If a role-specific subdir is set, pass it along
+  mkdir -p "$base"
   if [ -n "$subdir" ]; then
-    APP_SUBDIR="$subdir" APP_BASE="$APP_BASE" "$script" "$cmd"
+    APP_BASE="$base" APP_SUBDIR="$subdir" "$script" "$cmd"
   else
-    APP_BASE="$APP_BASE" "$script" "$cmd"
+    APP_BASE="$base" "$script" "$cmd"
   fi
 }
 
 usage(){
 cat <<'EOF'
 Usage:
-  sudo ./manage.sh install-all           # install scoreboard + target + attacker
-  sudo ./manage.sh start-everything      # install-all + start all services
-  sudo ./manage.sh start-all             # start all services (no install)
-  sudo ./manage.sh stop-all              # stop all role services
-  sudo ./manage.sh status-all            # status for all role services
+  sudo ./manage.sh install-all
+  sudo ./manage.sh start-everything
+  sudo ./manage.sh start-all
+  sudo ./manage.sh stop-all
+  sudo ./manage.sh status-all
 
 Per-role:
-  sudo ./manage.sh scoreboard install
-  sudo ./manage.sh scoreboard start
-  sudo ./manage.sh scoreboard stop
-  sudo ./manage.sh scoreboard status
+  sudo ./manage.sh scoreboard install|start|stop|status
+  sudo ./manage.sh target     install|start|stop|status
+  sudo ./manage.sh attacker   install|start|stop|status
 
-  sudo ./manage.sh target install|start|stop|status
-  sudo ./manage.sh attacker install|start|stop|status
-
-Env overrides:
-  APP_BASE=/path/to/repo/root
-  SCOREBOARD_SUBDIR=scoreboard  TARGET_SUBDIR=target  ATTACKER_SUBDIR=attacker
-  SCOREBOARD_SCRIPT=./custom-scoreboard.sh (and similarly for others)
-
+Env:
+  BASE_ROOT=/opt/maccdc
+  SCOREBOARD_BASE=/opt/maccdc/scoreboard TARGET_BASE=/opt/maccdc/target ATTACKER_BASE=/opt/maccdc/attacker
+  SCOREBOARD_SUBDIR=scoreboard TARGET_SUBDIR=target ATTACKER_SUBDIR=attacker
 EOF
 }
 
 main(){
-  if ! is_root; then echo "[manage] please run with sudo/root"; exit 2; fi
-  if ! need_scripts; then
-    echo "[manage] expected setup scripts not found at:"
-    echo "  $SCOREBOARD_SCRIPT"
-    echo "  $TARGET_SCRIPT"
-    echo "  $ATTACKER_SCRIPT"
-    exit 2
-  fi
+  is_root || { echo "[manage] please run with sudo/root"; exit 2; }
+  need_scripts || { echo "[manage] setup scripts not found"; exit 2; }
   make_exec
 
-  local cmd="${1:-help}"
-  case "$cmd" in
+  case "${1:-help}" in
     install-all)
-      run_role scoreboard install-all "$SCOREBOARD_SUBDIR"
-      run_role target     install-all "$TARGET_SUBDIR"
-      run_role attacker   install-all "$ATTACKER_SUBDIR"
+      run_role scoreboard install-all "$SCOREBOARD_BASE" "$SCOREBOARD_SUBDIR"
+      run_role target     install-all "$TARGET_BASE"     "$TARGET_SUBDIR"
+      run_role attacker   install-all "$ATTACKER_BASE"   "$ATTACKER_SUBDIR"
       ;;
     start-everything)
-      # Full bootstrap, then start
       "$0" install-all
       "$0" start-all
       ;;
     start-all)
-      run_role scoreboard start-web "$SCOREBOARD_SUBDIR"
-      run_role target     start-web "$TARGET_SUBDIR"
-      run_role attacker   start-web "$ATTACKER_SUBDIR"
+      run_role scoreboard start-web "$SCOREBOARD_BASE" "$SCOREBOARD_SUBDIR"
+      run_role target     start-web "$TARGET_BASE"     "$TARGET_SUBDIR"
+      run_role attacker   start-web "$ATTACKER_BASE"   "$ATTACKER_SUBDIR"
       ;;
     stop-all)
-      run_role scoreboard stop-all "$SCOREBOARD_SUBDIR"
-      run_role target     stop-all "$TARGET_SUBDIR"
-      run_role attacker   stop-all "$ATTACKER_SUBDIR"
+      run_role scoreboard stop-all "$SCOREBOARD_BASE" "$SCOREBOARD_SUBDIR"
+      run_role target     stop-all "$TARGET_BASE"     "$TARGET_SUBDIR"
+      run_role attacker   stop-all "$ATTACKER_BASE"   "$ATTACKER_SUBDIR"
       ;;
     status-all)
-      echo "----- SCOREBOARD -----"; run_role scoreboard status "$SCOREBOARD_SUBDIR" || true
-      echo "----- TARGET -----";     run_role target     status "$TARGET_SUBDIR"   || true
-      echo "----- ATTACKER -----";   run_role attacker   status "$ATTACKER_SUBDIR" || true
+      echo "----- SCOREBOARD -----"; run_role scoreboard status "$SCOREBOARD_BASE" "$SCOREBOARD_SUBDIR" || true
+      echo "----- TARGET -----";     run_role target     status "$TARGET_BASE"     "$TARGET_SUBDIR"   || true
+      echo "----- ATTACKER -----";   run_role attacker   status "$ATTACKER_BASE"   "$ATTACKER_SUBDIR" || true
       ;;
     scoreboard|target|attacker)
+      role="$1"; sub=""; base=""
+      [ "$role" = scoreboard ] && { base="$SCOREBOARD_BASE"; sub="$SCOREBOARD_SUBDIR"; }
+      [ "$role" = target     ] && { base="$TARGET_BASE";     sub="$TARGET_SUBDIR"; }
+      [ "$role" = attacker   ] && { base="$ATTACKER_BASE";   sub="$ATTACKER_SUBDIR"; }
       case "${2:-}" in
-        install) run_role "$cmd" install-all "$( [ "$cmd" = scoreboard ] && echo "$SCOREBOARD_SUBDIR" || [ "$cmd" = target ] && echo "$TARGET_SUBDIR" || echo "$ATTACKER_SUBDIR")" ;;
-        start)   run_role "$cmd" start-web    "$( [ "$cmd" = scoreboard ] && echo "$SCOREBOARD_SUBDIR" || [ "$cmd" = target ] && echo "$TARGET_SUBDIR" || echo "$ATTACKER_SUBDIR")" ;;
-        stop)    run_role "$cmd" stop-all     "$( [ "$cmd" = scoreboard ] && echo "$SCOREBOARD_SUBDIR" || [ "$cmd" = target ] && echo "$TARGET_SUBDIR" || echo "$ATTACKER_SUBDIR")" ;;
-        status)  run_role "$cmd" status       "$( [ "$cmd" = scoreboard ] && echo "$SCOREBOARD_SUBDIR" || [ "$cmd" = target ] && echo "$TARGET_SUBDIR" || echo "$ATTACKER_SUBDIR")" ;;
+        install) run_role "$role" install-all "$base" "$sub" ;;
+        start)   run_role "$role" start-web    "$base" "$sub" ;;
+        stop)    run_role "$role" stop-all     "$base" "$sub" ;;
+        status)  run_role "$role" status       "$base" "$sub" ;;
         *) usage; exit 2 ;;
       esac
       ;;
-    help|--help|-h|"")
-      usage
-      ;;
-    *)
-      usage; exit 2 ;;
+    help|--help|-h|"") usage ;;
+    *) usage; exit 2 ;;
   esac
 }
-
 main "$@"
