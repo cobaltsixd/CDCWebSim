@@ -1,79 +1,88 @@
 #!/usr/bin/env bash
-# manage.sh — Orchestrator for CDCWebSim role setups on Kali
-# - Resolves setup scripts relative to this file's directory (SCRIPT_DIR)
-# - Provides: install-all, start-everything, start-all, stop-all, status-all
-# - Per-role commands: scoreboard|target|attacker with install|start|stop|status
+# manage.sh — robust orchestrator for CDCWebSim
+# - Resolves its own directory (SCRIPT_DIR)
+# - Prints diagnostics for the 3 wrapper scripts (ls -lb)
+# - Invokes wrappers with: bash "$SCRIPT" ... (avoids noexec / missing +x issues)
+# - Usage: sudo ./manage.sh install-all | start-all | status-all | scoreboard start | etc.
+
 set -euo pipefail
 
-# --- Resolve this script's directory so it reliably finds the setup wrappers ---
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-
-# --- Base install root (override with environment) ---
 BASE_ROOT="${BASE_ROOT:-/opt/maccdc}"
 
-# --- Setup script paths (anchored to SCRIPT_DIR so cwd doesn't matter) ---
+# anchor wrapper script paths to the script dir
 SCOREBOARD_SCRIPT="${SCOREBOARD_SCRIPT:-${SCRIPT_DIR}/setup-scoreboard.sh}"
 TARGET_SCRIPT="${TARGET_SCRIPT:-${SCRIPT_DIR}/setup-target.sh}"
 ATTACKER_SCRIPT="${ATTACKER_SCRIPT:-${SCRIPT_DIR}/setup-attacker.sh}"
 
-# --- Default role base installation directories (override with env if needed) ---
 SCOREBOARD_BASE="${SCOREBOARD_BASE:-$BASE_ROOT/scoreboard}"
 TARGET_BASE="${TARGET_BASE:-$BASE_ROOT/target}"
 ATTACKER_BASE="${ATTACKER_BASE:-$BASE_ROOT/attacker}"
 
-# Optional subdir inside the repo if your app lives under a subfolder (e.g., "app")
 SCOREBOARD_SUBDIR="${SCOREBOARD_SUBDIR:-}"
 TARGET_SUBDIR="${TARGET_SUBDIR:-}"
 ATTACKER_SUBDIR="${ATTACKER_SUBDIR:-}"
 
-# --- Helpers ---
-is_root() { [ "$(id -u)" -eq 0 ]; }
+is_root(){ [ "$(id -u)" -eq 0 ]; }
 
-need_scripts() {
-  local ok=1
-  for f in "$SCOREBOARD_SCRIPT" "$TARGET_SCRIPT" "$ATTACKER_SCRIPT"; do
-    if [ ! -f "$f" ]; then
-      echo "[manage] missing: $f" >&2
-      ok=0
+diagnostics(){
+  echo "== manage.sh diagnostics =="
+  echo "manage.sh path: $SCRIPT_DIR/manage.sh"
+  echo
+  echo "Checking wrapper script files (raw byte-visible names and perms):"
+  for s in "$SCOREBOARD_SCRIPT" "$TARGET_SCRIPT" "$ATTACKER_SCRIPT"; do
+    if [ -e "$s" ]; then
+      ls -lb -d "$s"
+      echo " first 2 lines:"
+      sed -n '1,2p' "$s" 2>/dev/null | sed -n '1,2p' | sed -n '1,2p' || true
+    else
+      echo " MISSING: $s"
     fi
+    echo "----"
   done
-  return $ok
+  echo
+  echo "Note: wrappers will be invoked with 'bash <script> <cmd>' to avoid noexec/permission issues."
+  echo "================================="
 }
 
-make_exec() {
-  # make sure wrapper scripts are executable (no-op if missing)
-  chmod +x "$SCOREBOARD_SCRIPT" "$TARGET_SCRIPT" "$ATTACKER_SCRIPT" 2>/dev/null || true
+need_scripts(){
+  for f in "$SCOREBOARD_SCRIPT" "$TARGET_SCRIPT" "$ATTACKER_SCRIPT"; do
+    [ -f "$f" ] || return 1
+  done
+  return 0
 }
 
-# run_role role cmd base subdir
-# role: scoreboard|target|attacker
-# cmd: install-all | start-web | start-db | stop-all | status
-run_role() {
-  local role="$1"
-  local cmd="$2"
-  local base="$3"
-  local subdir="${4:-}"
+# run wrapper script with bash interpreter: bash "$script" "$cmd"
+run_wrapper(){
+  local script_path="$1"; shift
+  if [ ! -f "$script_path" ]; then
+    echo "[manage] wrapper missing: $script_path" >&2
+    return 2
+  fi
+  # call via bash so noexec / missing +x won't block it
+  bash "$script_path" "$@"
+  return $?
+}
+
+run_role(){
+  local role="$1" cmd="$2" base="$3" subdir="${4:-}"
   local script
-
   case "$role" in
     scoreboard) script="$SCOREBOARD_SCRIPT" ;;
     target)     script="$TARGET_SCRIPT" ;;
     attacker)   script="$ATTACKER_SCRIPT" ;;
-    *)
-      echo "[manage] unknown role: $role" >&2
-      return 2
-      ;;
+    *) echo "[manage] unknown role: $role" >&2; return 2 ;;
   esac
 
   mkdir -p "$base"
   if [ -n "$subdir" ]; then
-    APP_BASE="$base" APP_SUBDIR="$subdir" "$script" "$cmd"
+    APP_BASE="$base" APP_SUBDIR="$subdir" run_wrapper "$script" "$cmd"
   else
-    APP_BASE="$base" "$script" "$cmd"
+    APP_BASE="$base" run_wrapper "$script" "$cmd"
   fi
 }
 
-usage() {
+usage(){
   cat <<'EOF'
 Usage:
   sudo ./manage.sh install-all
@@ -87,25 +96,26 @@ Per-role:
   sudo ./manage.sh target     install|start|stop|status
   sudo ./manage.sh attacker   install|start|stop|status
 
-Environment overrides:
-  BASE_ROOT=/opt/maccdc
-  SCOREBOARD_BASE=/opt/maccdc/scoreboard TARGET_BASE=/opt/maccdc/target ATTACKER_BASE=/opt/maccdc/attacker
-  SCOREBOARD_SUBDIR=scoreboard TARGET_SUBDIR=target ATTACKER_SUBDIR=attacker
+If you still see "setup scripts not found", run:
+  ls -lb manage.sh setup-*.sh
+  sed -n '1,3p' setup-scoreboard.sh | sed -n '1,3p'
 EOF
 }
 
-main() {
+main(){
+  # Quick diagnostics always printed (helps spot CRLF or bad names)
+  diagnostics
+
   if ! is_root; then
     echo "[manage] please run with sudo/root"
     exit 2
   fi
 
   if ! need_scripts; then
-    echo "[manage] setup scripts not found"
+    echo "[manage] setup scripts not found (checked the absolute paths above)."
+    echo "[manage] If files exist, try: sudo bash ./manage.sh status-all"
     exit 2
   fi
-
-  make_exec
 
   case "${1:-help}" in
     install-all)
@@ -115,7 +125,6 @@ main() {
       ;;
 
     start-everything)
-      # Full bootstrap then start everything
       "$0" install-all
       "$0" start-all
       ;;
@@ -142,22 +151,17 @@ main() {
       ;;
 
     scoreboard|target|attacker)
-      local role="$1"
-      local cmd="${2:-}"
+      local role="$1" cmd="${2:-}"
       local base="" sub=""
-      if [ "$role" = scoreboard ]; then base="$SCOREBOARD_BASE"; sub="$SCOREBOARD_SUBDIR"; fi
-      if [ "$role" = target ];     then base="$TARGET_BASE";     sub="$TARGET_SUBDIR";     fi
-      if [ "$role" = attacker ];   then base="$ATTACKER_BASE";   sub="$ATTACKER_SUBDIR";   fi
-
+      [ "$role" = scoreboard ] && { base="$SCOREBOARD_BASE"; sub="$SCOREBOARD_SUBDIR"; }
+      [ "$role" = target ]     && { base="$TARGET_BASE";     sub="$TARGET_SUBDIR"; }
+      [ "$role" = attacker ]   && { base="$ATTACKER_BASE";   sub="$ATTACKER_SUBDIR"; }
       case "$cmd" in
         install) run_role "$role" install-all "$base" "$sub" ;;
         start)   run_role "$role" start-web    "$base" "$sub" ;;
         stop)    run_role "$role" stop-all     "$base" "$sub" ;;
         status)  run_role "$role" status       "$base" "$sub" ;;
-        *)
-          usage
-          exit 2
-          ;;
+        *) usage; exit 2 ;;
       esac
       ;;
 
