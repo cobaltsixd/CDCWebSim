@@ -6,35 +6,33 @@
 #
 # Usage:
 #   sudo bash setup-attacker.sh
-#
 set -euo pipefail
 
 SIM_DIR="/opt/attacker-sim"
-LOG_DIR="/var/log"
 SIM_LOG="/var/log/attacker-sim.log"
-HTTP_DOCROOT="/var/www/html"
+ALERT_JSON="/var/log/attacker-sim-alerts.json"
 SERVICE_NAME="attacker-sim.service"
 TIMER_NAME="attacker-sim.timer"
 
-# require root
 if [ "$(id -u)" -ne 0 ]; then
-  echo "Run as root (sudo). Exiting."
+  echo "Please run as root (sudo). Exiting."
   exit 1
 fi
 
-# create sim dir
+echo "[*] Creating simulator directory: ${SIM_DIR}"
 mkdir -p "${SIM_DIR}"
 chown root:root "${SIM_DIR}"
 chmod 755 "${SIM_DIR}"
 
-# create main log
+echo "[*] Creating main log: ${SIM_LOG}"
 touch "${SIM_LOG}"
 chown root:adm "${SIM_LOG}" || true
 chmod 640 "${SIM_LOG}"
 
-# small helpers
+# helper functions file
 cat > "${SIM_DIR}/utils.sh" <<'EOF'
 #!/usr/bin/env bash
+# small helpers
 rand_int(){ shuf -n1 -i "$1-$2"; }
 rand_ip(){
   case $(rand_int 1 3) in
@@ -47,12 +45,12 @@ rand_user(){
   arr=(root admin test guest alice bob carol devops www-data svc_backup)
   echo "${arr[$(rand_int 0 $((${#arr[@]} - 1)))]}"
 }
-now(){ date -u +"%b %d %H:%M:%S"; } # syslog-like
+now(){ date -u +"%b %d %H:%M:%S"; }   # syslog-like
 ts_iso(){ date -u +"%Y-%m-%dT%H:%M:%SZ"; }
 EOF
 chmod 700 "${SIM_DIR}/utils.sh"
 
-# generator: auth failures into /var/log/auth.log (or attacker-sim.log fallback)
+# generator: auth failures
 cat > "${SIM_DIR}/gen_authfail.sh" <<'EOF'
 #!/usr/bin/env bash
 SIM_LOG="/var/log/attacker-sim.log"
@@ -64,18 +62,18 @@ user=$(rand_user)
 attempts=$(rand_int 2 10)
 
 for i in $(seq 1 ${attempts}); do
-  line="$(now) kali-host sshd[${$}]: Failed password for ${user} from ${src} port $(rand_int 1024 65535) ssh2"
+  line="$(now) kali-host sshd[$$]: Failed password for ${user} from ${src} port $(rand_int 1024 65535) ssh2"
   if [ -w "${TARGET_AUTH}" ]; then
-    echo "${line}" >> "${TARGET_AUTH}"
+    echo "${line}" >> "${TARGET_AUTH}" || true
   else
-    echo "${ts_iso()} AUTHFAIL src=${src} user=${user} attempt=${i}" >> "${SIM_LOG}"
+    echo "$(ts_iso) AUTHFAIL src=${src} user=${user} attempt=${i}" >> "${SIM_LOG}" || true
   fi
   sleep 0.08
 done
 EOF
 chmod 700 "${SIM_DIR}/gen_authfail.sh"
 
-# generator: web requests into apache/nginx access log or attacker log
+# generator: web probe (writes to apache/nginx logs if present else sim log)
 cat > "${SIM_DIR}/gen_webprobe.sh" <<'EOF'
 #!/usr/bin/env bash
 SIM_LOG="/var/log/attacker-sim.log"
@@ -91,20 +89,19 @@ for i in $(seq 1 $(rand_int 1 6)); do
   path=${paths[$(rand_int 0 $((${#paths[@]} - 1)))]}
   payload=${payloads[$(rand_int 0 $((${#payloads[@]} - 1)))]}
   ua="Mozilla/5.0 (compatible; BadBot/1.0)"
-  nowt="$(now)"
   logline="${src} - - [$(date -u +'%d/%b/%Y:%H:%M:%S +0000')] \"GET ${path}?${payload} HTTP/1.1\" 200 1234 \"-\" \"${ua}\""
   if [ -w "${APACHE_LOG}" ]; then
-    echo "${logline}" >> "${APACHE_LOG}"
+    echo "${logline}" >> "${APACHE_LOG}" || true
   elif [ -w "${NGINX_LOG}" ]; then
-    echo "${logline}" >> "${NGINX_LOG}"
+    echo "${logline}" >> "${NGINX_LOG}" || true
   else
-    echo "$(ts_iso()) WEBPROBE src=${src} path=${path} payload='${payload}' ua='${ua}'" >> "${SIM_LOG}"
+    echo "$(ts_iso) WEBPROBE src=${src} path=${path} payload='${payload}' ua='${ua}'" >> "${SIM_LOG}" || true
   fi
 done
 EOF
 chmod 700 "${SIM_DIR}/gen_webprobe.sh"
 
-# generator: fake phishing/mail logs
+# generator: phishing/mail-like logs
 cat > "${SIM_DIR}/gen_phish.sh" <<'EOF'
 #!/usr/bin/env bash
 SIM_LOG="/var/log/attacker-sim.log"
@@ -117,17 +114,17 @@ for i in $(seq 1 $(rand_int 1 4)); do
   src="mailer@${domains[$(rand_int 0 $((${#domains[@]} - 1)))]}"
   dst="$(rand_user)@${domains[$(rand_int 0 $((${#domains[@]} - 1)))]}"
   subj="${subjects[$(rand_int 0 $((${#subjects[@]} - 1)))]}"
-  line="$(now) kali-mail postfix/smtp[${$}]: to=<${dst}>, relay=none, delay=0.1, status=deferred (simulated)"
+  line="$(now) kali-mail postfix/smtp[$$]: to=<${dst}>, relay=none, delay=0.1, status=deferred (simulated)"
   if [ -w "${MAIL_LOG}" ]; then
-    echo "${line}" >> "${MAIL_LOG}"
+    echo "${line}" >> "${MAIL_LOG}" || true
   else
-    echo "$(ts_iso()) PHISH src=${src} dst=${dst} subject='${subj}' action=delivered" >> "${SIM_LOG}"
+    echo "$(ts_iso) PHISH src=${src} dst=${dst} subject='${subj}' action=delivered" >> "${SIM_LOG}" || true
   fi
 done
 EOF
 chmod 700 "${SIM_DIR}/gen_phish.sh"
 
-# generator: place "malicious" artifact in webroot (harmless)
+# plant harmless file in webroot
 cat > "${SIM_DIR}/plant_webshell.sh" <<'EOF'
 #!/usr/bin/env bash
 DOCROOT="/var/www/html"
@@ -137,13 +134,13 @@ source "$(dirname "$0")/utils.sh"
 mkdir -p "${DOCROOT}"
 fn="suspicious_$(date -u +%Y%m%d%H%M%S).txt"
 echo "# harmless indicator file - do not execute" > "${DOCROOT}/${fn}"
-echo "created_by=attacker-sim created_at=$(ts_iso()) note='indicator file for detection exercises'" >> "${DOCROOT}/${fn}"
-chmod 644 "${DOCROOT}/${fn}"
-echo "$(ts_iso()) PLANT file=${DOCROOT}/${fn} note='planted harmless indicator in webroot'" >> "${SIM_LOG}"
+echo "created_by=attacker-sim created_at=$(ts_iso) note='indicator file for detection exercises'" >> "${DOCROOT}/${fn}"
+chmod 644 "${DOCROOT}/${fn}" || true
+echo "$(ts_iso) PLANT file=${DOCROOT}/${fn} note='planted harmless indicator in webroot'" >> "${SIM_LOG}" || true
 EOF
 chmod 700 "${SIM_DIR}/plant_webshell.sh"
 
-# generator: create fake credential dump artifact (harmless)
+# create harmless credential dump artifact
 cat > "${SIM_DIR}/dump_creds.sh" <<'EOF'
 #!/usr/bin/env bash
 OUT="/opt/attacker-sim/creds_dump_$(date -u +%Y%m%d%H%M%S).txt"
@@ -153,12 +150,12 @@ source "$(dirname "$0")/utils.sh"
 echo "# fake creds dump - harmless" > "${OUT}"
 echo "admin:AdminPass123" >> "${OUT}"
 echo "service:ServicePass!" >> "${OUT}"
-chmod 600 "${OUT}"
-echo "$(ts_iso()) ARTIFACT created=${OUT} note='fake creds dump for detection/testing'" >> "${SIM_LOG}"
+chmod 600 "${OUT}" || true
+echo "$(ts_iso) ARTIFACT created=${OUT} note='fake creds dump for detection/testing'" >> "${SIM_LOG}" || true
 EOF
 chmod 700 "${SIM_DIR}/dump_creds.sh"
 
-# generator: produce IDS-like alerts (JSON lines) for SIEM ingestion
+# IDS-like JSON alerts
 cat > "${SIM_DIR}/gen_ids_alert.sh" <<'EOF'
 #!/usr/bin/env bash
 SIM_LOG="/var/log/attacker-sim.log"
@@ -168,25 +165,25 @@ source "$(dirname "$0")/utils.sh"
 types=("ET SCAN SYN Stealth" "WEB-ATTACK SQLi" "MALWARE C2" "SUSPICIOUS AUTH")
 for i in $(seq 1 $(rand_int 1 4)); do
   alert="${types[$(rand_int 0 $((${#types[@]} - 1)))]}"
-  obj="{\"timestamp\":\"$(ts_iso())\",\"alert\":\"${alert}\",\"src\":\"$(rand_ip())\",\"dst\":\"$(rand_ip())\",\"signature_id\":$(rand_int 1000 9999)}"
-  echo "${obj}" >> "${ALERT_FILE}"
-  echo "$(ts_iso()) IDS alert written ${alert}" >> "${SIM_LOG}"
+  obj="{\"timestamp\":\"$(ts_iso)\",\"alert\":\"${alert}\",\"src\":\"$(rand_ip)\",\"dst\":\"$(rand_ip)\",\"signature_id\":$(rand_int 1000 9999)}"
+  echo "${obj}" >> "${ALERT_FILE}" || true
+  echo "$(ts_iso) IDS alert written ${alert}" >> "${SIM_LOG}" || true
 done
 EOF
 chmod 700 "${SIM_DIR}/gen_ids_alert.sh"
 
-# orchestrator runner: choose scenario and run several generators
+# orchestrator runner
 cat > "${SIM_DIR}/runner.sh" <<'EOF'
 #!/usr/bin/env bash
 SIM_LOG="/var/log/attacker-sim.log"
 SIM_DIR="$(dirname "$0")"
 source "${SIM_DIR}/utils.sh"
 
-# rotate sim log if big
+# rotate sim log if large
 if [ -f "${SIM_LOG}" ]; then
   lines=$(wc -l < "${SIM_LOG}" || echo 0)
   if [ "${lines}" -gt 20000 ]; then
-    mv "${SIM_LOG}" "${SIM_LOG}.$(date -u +%Y%m%d%H%M%S)"
+    mv "${SIM_LOG}" "${SIM_LOG}.$(date -u +%Y%m%d%H%M%S)" || true
     touch "${SIM_LOG}"
     chmod 640 "${SIM_LOG}" || true
   fi
@@ -194,7 +191,6 @@ fi
 
 case $(rand_int 1 10) in
   1|2|3)
-    # low activity day
     "${SIM_DIR}/gen_webprobe.sh"
     ;;
   4|5|6)
@@ -212,7 +208,6 @@ case $(rand_int 1 10) in
     "${SIM_DIR}/gen_ids_alert.sh"
     ;;
   10)
-    # noisy day: everything
     "${SIM_DIR}/gen_authfail.sh"
     sleep 0.1
     "${SIM_DIR}/gen_webprobe.sh"
@@ -224,14 +219,14 @@ case $(rand_int 1 10) in
     ;;
 esac
 
-# occasional marker for escalation exercises
+# occasional marker event for escalation playbooks
 if [ "$(rand_int 1 20)" -eq 1 ]; then
-  echo "$(ts_iso()) EVENT escalation=simulated_priv_esc note='no exploit executed; marker for playbook' " >> "${SIM_LOG}"
+  echo "$(ts_iso) EVENT escalation=simulated_priv_esc note='no exploit executed; marker for playbook' " >> "${SIM_LOG}" || true
 fi
 EOF
 chmod 700 "${SIM_DIR}/runner.sh"
 
-# systemd service & timer
+# systemd service and timer
 SERVICE_PATH="/etc/systemd/system/${SERVICE_NAME}"
 TIMER_PATH="/etc/systemd/system/${TIMER_NAME}"
 
@@ -262,11 +257,11 @@ Unit=${SERVICE_NAME}
 WantedBy=timers.target
 EOF
 
-# reload and enable
+echo "[*] Reloading systemd and enabling timer..."
 systemctl daemon-reload
 systemctl enable --now "${TIMER_NAME}"
 
-# README for operators
+# README
 cat > "${SIM_DIR}/README.txt" <<'EOF'
 Attacker Behavior Simulator (safe)
 ---------------------------------
@@ -291,16 +286,20 @@ Notes:
  - To remove: sudo systemctl disable --now ${TIMER_NAME}; rm -rf ${SIM_DIR}; rm -f ${SERVICE_PATH} ${TIMER_PATH}
 EOF
 
+echo
 echo "[*] Setup complete."
 echo " - Simulator dir: ${SIM_DIR}"
 echo " - Main log: ${SIM_LOG}"
-echo " - Alert JSON: /var/log/attacker-sim-alerts.json"
+echo " - Alert JSON: ${ALERT_JSON}"
 echo " - Systemd timer: ${TIMER_NAME} (runs every 60s)"
 echo
 echo "Quick checks:"
-echo "  tail -n 80 /var/log/attacker-sim.log"
-echo "  ls -l /opt/attacker-sim"
-echo "  systemctl list-timers --all | grep attacker-sim"
-echo "  tail -n 50 /var/log/apache2/access.log  # if apache present"
+echo "  systemctl status ${TIMER_NAME}"
+echo "  tail -n 80 ${SIM_LOG}"
+echo "  tail -n 80 ${ALERT_JSON}"
+echo "  ls -l ${SIM_DIR}"
 echo
+echo "Manual test (run a mixed scenario now):"
+echo "  sudo ${SIM_DIR}/runner.sh && tail -n 60 ${SIM_LOG}"
 echo
+exit 0
