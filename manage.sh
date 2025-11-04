@@ -1,32 +1,45 @@
 #!/usr/bin/env bash
-# manage.sh - Orchestrator for CDCWebSim role setups on Kali (safe /opt paths)
+# manage.sh — Orchestrator for CDCWebSim role setups on Kali
+# Safely manages install/start/stop/status for scoreboard, target, and attacker.
+# Works even if run from a different directory (auto-resolves SCRIPT_DIR).
 
 set -euo pipefail
 
-# Root where each role will live (can override with BASE_ROOT=/some/path)
+# --- Resolve absolute script directory (important!) ---
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+# --- Base install root (can override with BASE_ROOT=/some/path) ---
 BASE_ROOT="${BASE_ROOT:-/opt/maccdc}"
 
-# Setup script paths (relative to where you run manage.sh)
-SCOREBOARD_SCRIPT="${SCOREBOARD_SCRIPT:-./setup-scoreboard.sh}"
-TARGET_SCRIPT="${TARGET_SCRIPT:-./setup-target.sh}"
-ATTACKER_SCRIPT="${ATTACKER_SCRIPT:-./setup-attacker.sh}"
+# --- Role setup script paths (anchored to SCRIPT_DIR) ---
+SCOREBOARD_SCRIPT="${SCOREBOARD_SCRIPT:-${SCRIPT_DIR}/setup-scoreboard.sh}"
+TARGET_SCRIPT="${TARGET_SCRIPT:-${SCRIPT_DIR}/setup-target.sh}"
+ATTACKER_SCRIPT="${ATTACKER_SCRIPT:-${SCRIPT_DIR}/setup-attacker.sh}"
 
+# --- Role base directories ---
 SCOREBOARD_BASE="${SCOREBOARD_BASE:-$BASE_ROOT/scoreboard}"
 TARGET_BASE="${TARGET_BASE:-$BASE_ROOT/target}"
 ATTACKER_BASE="${ATTACKER_BASE:-$BASE_ROOT/attacker}"
 
+# --- Optional subdirectories inside repo (empty by default) ---
 SCOREBOARD_SUBDIR="${SCOREBOARD_SUBDIR:-}"
 TARGET_SUBDIR="${TARGET_SUBDIR:-}"
 ATTACKER_SUBDIR="${ATTACKER_SUBDIR:-}"
 
+# --- Helpers ---
 is_root(){ [ "$(id -u)" -eq 0 ]; }
+
 need_scripts(){
   local ok=1
   for f in "$SCOREBOARD_SCRIPT" "$TARGET_SCRIPT" "$ATTACKER_SCRIPT"; do
-    [ -f "$f" ] || { echo "[manage] missing: $f" >&2; ok=0; }
+    if [ ! -f "$f" ]; then
+      echo "[manage] missing: $f" >&2
+      ok=0
+    fi
   done
   return $ok
 }
+
 make_exec(){ chmod +x "$SCOREBOARD_SCRIPT" "$TARGET_SCRIPT" "$ATTACKER_SCRIPT" 2>/dev/null || true; }
 
 run_role(){
@@ -59,13 +72,14 @@ Per-role:
   sudo ./manage.sh target     install|start|stop|status
   sudo ./manage.sh attacker   install|start|stop|status
 
-Env:
+Environment Overrides:
   BASE_ROOT=/opt/maccdc
   SCOREBOARD_BASE=/opt/maccdc/scoreboard TARGET_BASE=/opt/maccdc/target ATTACKER_BASE=/opt/maccdc/attacker
   SCOREBOARD_SUBDIR=scoreboard TARGET_SUBDIR=target ATTACKER_SUBDIR=attacker
 EOF
 }
 
+# --- Main dispatcher ---
 main(){
   is_root || { echo "[manage] please run with sudo/root"; exit 2; }
   need_scripts || { echo "[manage] setup scripts not found"; exit 2; }
@@ -97,7 +111,7 @@ main(){
       echo "----- ATTACKER -----";   run_role attacker   status "$ATTACKER_BASE"   "$ATTACKER_SUBDIR" || true
       ;;
     scoreboard|target|attacker)
-      role="$1"; sub=""; base=""
+      local role="$1" sub="" base=""
       [ "$role" = scoreboard ] && { base="$SCOREBOARD_BASE"; sub="$SCOREBOARD_SUBDIR"; }
       [ "$role" = target     ] && { base="$TARGET_BASE";     sub="$TARGET_SUBDIR"; }
       [ "$role" = attacker   ] && { base="$ATTACKER_BASE";   sub="$ATTACKER_SUBDIR"; }
@@ -113,4 +127,5 @@ main(){
     *) usage; exit 2 ;;
   esac
 }
+
 main "$@"
