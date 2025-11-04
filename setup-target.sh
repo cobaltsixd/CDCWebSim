@@ -1,54 +1,35 @@
 #!/usr/bin/env bash
-# MACCDC Target Host Setup (Kali Linux)
-# Installs: Apache+PHP (web), MariaDB (db)
-# Mode: --vuln (default) exposes weak configs for hardening practice
-#       --harden applies safer defaults
-# Re-run safe. No Python or external tooling required.
-
+# setup-target.sh
+# MACCDC Target Installer (Kali) - nginx + php-fpm + MariaDB
+# Modes: --vuln (default) = intentionally weak for student hardening exercises
+#        --harden        = safer baseline (removes phpinfo, disables autoindex, binds DB to localhost)
+#
+# Save as setup-target.sh, make executable (chmod +x), run with sudo:
+#   sudo ./setup-target.sh --vuln
+#   sudo ./setup-target.sh --harden
 set -euo pipefail
 
 ### --------------------------
-### Config (can be overridden by env or flags)
+### Configurable defaults (override via env)
 ### --------------------------
-MODE="${MODE:-vuln}"                 # vuln | harden
-SITE_NAME="${SITE_NAME:-target}"     # Apache site name
-SITE_DIR="/var/www/${SITE_NAME}"
+MODE="${MODE:-vuln}"                # vuln | harden
+SITE_NAME="${SITE_NAME:-target}"
+SITE_DIR="${SITE_DIR:-/var/www/${SITE_NAME}}"
 DB_NAME="${DB_NAME:-scoredb}"
 DB_USER="${DB_USER:-webapp}"
-DB_PASS="${DB_PASS:-password}"       # intentionally weak in vuln mode
-DB_ROOT_PASS="${DB_ROOT_PASS:-root}" # set only if MariaDB has no root pw (local socket auth by default)
-LISTEN_HTTP_PORT="${LISTEN_HTTP_PORT:-80}"
-# In vuln mode we'll open MariaDB to all interfaces; in harden mode we keep it local only.
-DB_BIND_ALL="${DB_BIND_ALL:-}"
-APACHE_EXPOSE_TOKENS_ON="${APACHE_EXPOSE_TOKENS_ON:-}"
-AUTO_INDEX_ON="${AUTO_INDEX_ON:-}"
-PHP_INFO_PAGE_ON="${PHP_INFO_PAGE_ON:-}"
+DB_PASS="${DB_PASS:-password}"
+LISTEN_PORT="${LISTEN_PORT:-80}"
+PHP_VERSION="${PHP_VERSION:-8.4}"   # change only if your repo lacks 8.4
 
 ### --------------------------
-### Parse flags
+### Parse CLI flags
 ### --------------------------
 usage() {
   cat <<EOF
 Usage: sudo ./setup-target.sh [--vuln | --harden]
-
-Sets up a single Kali VM as the MACCDC target with:
-- Apache + PHP (web)
-- MariaDB (database)
-- Sample app + weak defaults (in --vuln) for students to harden
-
-Options:
-  --vuln     Default. Intentionally weak service posture.
-  --harden   Apply safer defaults (baseline hardening).
-
-Environment overrides:
-  MODE=vuln|harden SITE_NAME=target DB_NAME=scoredb DB_USER=webapp DB_PASS=password DB_ROOT_PASS=root LISTEN_HTTP_PORT=80
-
-Examples:
-  sudo ./setup-target.sh
-  sudo MODE=harden DB_PASS='S3cure!Pass' ./setup-target.sh --harden
+Defaults: --vuln
 EOF
 }
-
 while [[ "${1:-}" =~ ^- ]]; do
   case "$1" in
     --vuln) MODE="vuln"; shift ;;
@@ -63,29 +44,26 @@ if [[ $EUID -ne 0 ]]; then
   exit 1
 fi
 
-echo "[*] Mode: ${MODE}"
+echo "[*] Running target setup (mode=${MODE})"
 
+# Derived toggles
 if [[ "${MODE}" == "vuln" ]]; then
+  AUTOINDEX="on"
+  PHPINFO_ON="yes"
   DB_BIND_ALL="yes"
-  APACHE_EXPOSE_TOKENS_ON="yes"
-  AUTO_INDEX_ON="yes"
-  PHP_INFO_PAGE_ON="yes"
 else
+  AUTOINDEX="off"
+  PHPINFO_ON=""
   DB_BIND_ALL=""
-  APACHE_EXPOSE_TOKENS_ON=""
-  AUTO_INDEX_ON=""
-  PHP_INFO_PAGE_ON=""
 fi
 
 ### --------------------------
 ### Helpers
 ### --------------------------
-systemd_enable_restart() {
-  local svc="$1"
-  systemctl daemon-reload
-  systemctl enable --now "$svc"
-  systemctl restart "$svc"
-  systemctl status "$svc" --no-pager -l || true
+apt_install() {
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -y
+  apt-get install -y --no-install-recommends "$@"
 }
 
 file_backup() {
@@ -95,40 +73,56 @@ file_backup() {
   fi
 }
 
-apt_install() {
-  local pkgs=("$@")
-  export DEBIAN_FRONTEND=noninteractive
-  apt-get update -y
-  apt-get install -y --no-install-recommends "${pkgs[@]}"
+systemctl_enable_restart_ifexists() {
+  local svc="$1"
+  # enable/start only if unit is available
+  if systemctl list-unit-files --type=service | awk '{print $1}' | grep -qx "${svc}.service"; then
+    systemctl enable --now "${svc}.service" || true
+    systemctl restart "${svc}.service" || true
+  else
+    # try without .service for compatibility
+    if systemctl list-unit-files --type=service | awk '{print $1}' | grep -qx "${svc}"; then
+      systemctl enable --now "${svc}" || true
+      systemctl restart "${svc}" || true
+    fi
+  fi
 }
+
+### --------------------------
+### Stop/disable Apache if present (avoid port conflict)
+### --------------------------
+if systemctl list-unit-files | grep -q '^apache2'; then
+  echo "[*] Stopping & disabling apache2 to avoid conflicts (if present)"
+  systemctl stop apache2 || true
+  systemctl disable apache2 || true
+fi
 
 ### --------------------------
 ### Install packages
 ### --------------------------
-echo "[*] Installing Apache, PHP, MariaDB..."
-apt_install apache2 php libapache2-mod-php php-mysqli mariadb-server curl
+echo "[*] Installing nginx, php-fpm, php-mysql, mariadb..."
+apt_install nginx "php${PHP_VERSION}-fpm" "php${PHP_VERSION}-mysql" mariadb-server curl
 
 ### --------------------------
-### MariaDB config
+### MariaDB configuration (bind)
 ### --------------------------
-echo "[*] Configuring MariaDB..."
-# Bind-address
 MYSQL_CONF="/etc/mysql/mariadb.conf.d/50-server.cnf"
 file_backup "$MYSQL_CONF"
 
-if [[ -n "$DB_BIND_ALL" ]]; then
+if [[ -n "${DB_BIND_ALL}" ]]; then
   sed -i 's/^\s*#\?\s*bind-address\s*=.*/bind-address = 0.0.0.0/' "$MYSQL_CONF" || true
-  # if line absent, append
   grep -q 'bind-address' "$MYSQL_CONF" || echo "bind-address = 0.0.0.0" >> "$MYSQL_CONF"
 else
   sed -i 's/^\s*#\?\s*bind-address\s*=.*/bind-address = 127.0.0.1/' "$MYSQL_CONF" || true
   grep -q 'bind-address' "$MYSQL_CONF" || echo "bind-address = 127.0.0.1" >> "$MYSQL_CONF"
 fi
 
-systemd_enable_restart mariadb
+systemctl_enable_restart_ifexists mariadb
 
-# Create DB + user (idempotent)
-echo "[*] Creating database and user..."
+### --------------------------
+### Create DB, user, seed schema & flags (idempotent)
+### --------------------------
+echo "[*] Creating database and seeding sample data..."
 mysql -u root <<SQL || true
 CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\`;
 CREATE USER IF NOT EXISTS '${DB_USER}'@'%' IDENTIFIED BY '${DB_PASS}';
@@ -137,12 +131,11 @@ GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${DB_USER}'@'%' , '${DB_USER}'@'loc
 FLUSH PRIVILEGES;
 SQL
 
-# Schema and seed
 mysql -u root "${DB_NAME}" <<'SQL' || true
 CREATE TABLE IF NOT EXISTS users (
   id INT AUTO_INCREMENT PRIMARY KEY,
   username VARCHAR(64) UNIQUE,
-  password VARCHAR(64),
+  password VARCHAR(128),
   role VARCHAR(32) DEFAULT 'user'
 );
 INSERT IGNORE INTO users (id, username, password, role) VALUES
@@ -157,47 +150,36 @@ CREATE TABLE IF NOT EXISTS flags (
 INSERT IGNORE INTO flags (id, name, value) VALUES
   (1,'welcome','wvu6or7{target_ready}'),
   (2,'db_access','wvu6or7{mysql_basics}'),
-  (3,'web_misconfig','wvu6or7{fix_the_headers}');
+  (3,'web_misconfig','wvu6or7{nginx_fastcgi}');
 SQL
 
 ### --------------------------
-### Apache + PHP site
+### Prepare web root (sample app intentionally weak in vuln mode)
 ### --------------------------
-echo "[*] Configuring Apache vhost and content..."
-mkdir -p "${SITE_DIR}"
+echo "[*] Preparing web root: ${SITE_DIR}"
+mkdir -p "${SITE_DIR}/app"
+chown -R www-data:www-data "${SITE_DIR}"
+chmod -R 0755 "${SITE_DIR}"
 
-# Basic index + guidance (safe to show)
 cat > "${SITE_DIR}/index.php" <<'PHP'
 <?php
 $mode = getenv('TARGET_MODE') ?: 'vuln';
 ?>
-<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <title>MACCDC Target</title>
-</head>
-<body>
-  <h1>MACCDC Target Host</h1>
-  <p>Welcome to the target web service.</p>
+<!doctype html><html><head><meta charset="utf-8"><title>MACCDC Target</title></head><body>
+  <h1>MACCDC Target Host (nginx)</h1>
+  <p>Mode: <?php echo htmlspecialchars($mode); ?></p>
   <ul>
-    <li><a href="/app/login.php">Sample App (login)</a></li>
+    <li><a href="/app/login.php">Sample Login</a></li>
 <?php if ($mode === 'vuln'): ?>
     <li><a href="/app/search.php">User Search (SQLi-prone)</a></li>
-    <li><a href="/phpinfo.php">phpinfo()</a> (should be removed in hardening)</li>
+    <li><a href="/phpinfo.php">phpinfo()</a></li>
 <?php endif; ?>
   </ul>
-  <p><em>Mode:</em> <?php echo htmlspecialchars($mode); ?></p>
-</body>
-</html>
+</body></html>
 PHP
-
-# Sample "intentionally weak" app pages (for hardening practice)
-mkdir -p "${SITE_DIR}/app"
 
 cat > "${SITE_DIR}/app/login.php" <<'PHP'
 <?php
-/* Intentionally simple login to teach SQL injection prevention & auth hardening */
 $mysqli = @new mysqli(getenv('DB_HOST') ?: '127.0.0.1', getenv('DB_USER') ?: 'webapp',
                       getenv('DB_PASS') ?: 'password', getenv('DB_NAME') ?: 'scoredb', 3306);
 $err = $mysqli->connect_error ? "DB connect failed: ".$mysqli->connect_error : "";
@@ -205,7 +187,7 @@ $msg = "";
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
   $u = $_POST['username'] ?? '';
   $p = $_POST['password'] ?? '';
-  // VULN: string concat query — students should replace with prepared statements
+  # intentionally insecure query for exercise
   $sql = "SELECT username, role FROM users WHERE username='$u' AND password='$p' LIMIT 1";
   $res = $mysqli->query($sql);
   if ($res && $res->num_rows === 1) {
@@ -230,14 +212,12 @@ PHP
 
 cat > "${SITE_DIR}/app/search.php" <<'PHP'
 <?php
-/* Simple "user search" to show errors, listing, and input sanitization gaps */
 $mysqli = @new mysqli(getenv('DB_HOST') ?: '127.0.0.1', getenv('DB_USER') ?: 'webapp',
                       getenv('DB_PASS') ?: 'password', getenv('DB_NAME') ?: 'scoredb', 3306);
 $q = $_GET['q'] ?? '';
 $rows = [];
 $err = '';
 if ($q !== '') {
-  // VULN: LIKE with unsanitized input
   $sql = "SELECT id, username, role FROM users WHERE username LIKE '%$q%'";
   $res = $mysqli->query($sql);
   if ($res) { while($r = $res->fetch_assoc()) $rows[] = $r; } else { $err = $mysqli->error; }
@@ -261,8 +241,8 @@ if ($q !== '') {
 </body></html>
 PHP
 
-# Optional phpinfo page in vuln mode
-if [[ -n "$PHP_INFO_PAGE_ON" ]]; then
+# phpinfo (only in vuln mode)
+if [[ -n "${PHPINFO_ON}" ]]; then
   cat > "${SITE_DIR}/phpinfo.php" <<'PHP'
 <?php phpinfo();
 PHP
@@ -270,137 +250,131 @@ else
   rm -f "${SITE_DIR}/phpinfo.php" || true
 fi
 
-# robots.txt that leaks paths in vuln mode
-if [[ -n "$AUTO_INDEX_ON" ]]; then
-  cat > "${SITE_DIR}/robots.txt" <<'TXT'
-User-agent: *
-Disallow: /app/
-Allow: /app/search.php
-Sitemap: /sitemap.xml
-# Hint: clean this up during hardening
-TXT
-else
-  cat > "${SITE_DIR}/robots.txt" <<'TXT'
+# robots
+cat > "${SITE_DIR}/robots.txt" <<'TXT'
 User-agent: *
 Disallow:
 TXT
-fi
-
-# Apache vhost
-VHOST_CONF="/etc/apache2/sites-available/${SITE_NAME}.conf"
-cat > "$VHOST_CONF" <<EOF
-<VirtualHost *:${LISTEN_HTTP_PORT}>
-    ServerName ${SITE_NAME}.local
-    DocumentRoot ${SITE_DIR}
-
-    <Directory ${SITE_DIR}>
-        Options ${AUTO_INDEX_ON:+Indexes} FollowSymLinks
-        AllowOverride None
-        Require all granted
-    </Directory>
-
-    ErrorLog \${APACHE_LOG_DIR}/${SITE_NAME}_error.log
-    CustomLog \${APACHE_LOG_DIR}/${SITE_NAME}_access.log combined
-
-    # Headers students should fix in hardening:
-    ${APACHE_EXPOSE_TOKENS_ON:+ServerSignature On}
-    ${APACHE_EXPOSE_TOKENS_ON:+ServerTokens Full}
-    Header always set X-Powered-By "PHP/5 forever"   # intentionally bad; remove in hardening
-</VirtualHost>
-EOF
-
-# Apache ports config
-APACHE_PORTS="/etc/apache2/ports.conf"
-file_backup "$APACHE_PORTS"
-if ! grep -q "Listen ${LISTEN_HTTP_PORT}" "$APACHE_PORTS"; then
-  echo "Listen ${LISTEN_HTTP_PORT}" >> "$APACHE_PORTS"
-fi
-
-# Enable required modules and site
-a2enmod php* >/dev/null 2>&1 || true
-a2enmod headers >/dev/null 2>&1 || true
-[[ -n "$AUTO_INDEX_ON" ]] && a2enmod autoindex >/dev/null 2>&1 || a2dismod autoindex >/dev/null 2>&1 || true
-
-a2dissite 000-default >/dev/null 2>&1 || true
-a2ensite "${SITE_NAME}" >/dev/null
 
 chown -R www-data:www-data "${SITE_DIR}"
 chmod -R 0755 "${SITE_DIR}"
 
-systemd_enable_restart apache2
+### --------------------------
+### Detect php-fpm socket (robust)
+### --------------------------
+PHP_SOCK_CANDIDATES=(
+  "/run/php/php${PHP_VERSION}-fpm.sock"
+  "/run/php/php-fpm.sock"
+  "/var/run/php/php${PHP_VERSION}-fpm.sock"
+)
+FASTCGI_PASS="127.0.0.1:9000"  # default fallback
+
+for s in "${PHP_SOCK_CANDIDATES[@]}"; do
+  if [[ -S "$s" ]]; then
+    FASTCGI_PASS="unix:${s}"
+    break
+  fi
+done
 
 ### --------------------------
-### Environment hints for PHP app
+### Create nginx site config (fixed autoindex handling)
 ### --------------------------
-echo "[*] Writing app env hints..."
-APP_ENV_FILE="${SITE_DIR}/.env.sample"
-cat > "$APP_ENV_FILE" <<EOF
-# Copy to .env and adjust as needed. Apache doesn't read this automatically;
-# it's here as teaching material.
+NGINX_CONF="/etc/nginx/sites-available/${SITE_NAME}"
+file_backup "${NGINX_CONF}"
+
+# Ensure a valid autoindex value
+if [[ "${AUTOINDEX}" != "on" && "${AUTOINDEX}" != "off" ]]; then
+  AUTOINDEX="off"
+fi
+
+cat > "${NGINX_CONF}" <<EOF
+server {
+    listen ${LISTEN_PORT} default_server;
+    listen [::]:${LISTEN_PORT} default_server;
+
+    server_name _;
+
+    root ${SITE_DIR};
+    index index.php index.html index.htm;
+
+    access_log /var/log/nginx/${SITE_NAME}_access.log;
+    error_log  /var/log/nginx/${SITE_NAME}_error.log;
+
+    # Basic security headers - students should review and improve
+    add_header X-Frame-Options "DENY";
+    add_header X-Content-Type-Options "nosniff";
+    add_header Referrer-Policy "no-referrer-when-downgrade";
+
+    location / {
+        try_files \$uri \$uri/ /index.php?\$args;
+    }
+
+    location ~ \.php\$ {
+        include fastcgi_params;
+        fastcgi_index index.php;
+        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+        fastcgi_pass ${FASTCGI_PASS};
+    }
+
+    location ~ /\. {
+      deny all;
+      access_log off;
+      log_not_found off;
+    }
+
+    autoindex ${AUTOINDEX};
+}
+EOF
+
+# Enable site
+ln -sf "${NGINX_CONF}" "/etc/nginx/sites-enabled/${SITE_NAME}"
+# Remove default to avoid conflicts
+rm -f /etc/nginx/sites-enabled/default
+
+### --------------------------
+### .env.sample (teaching)
+### --------------------------
+cat > "${SITE_DIR}/.env.sample" <<EOF
 DB_HOST=127.0.0.1
 DB_NAME=${DB_NAME}
 DB_USER=${DB_USER}
 DB_PASS=${DB_PASS}
 TARGET_MODE=${MODE}
 EOF
-
-# Export basic env for Apache via systemd drop-in (teaching-friendly)
-APACHE_ENV_DIR="/etc/systemd/system/apache2.service.d"
-mkdir -p "$APACHE_ENV_DIR"
-cat > "${APACHE_ENV_DIR}/env.conf" <<EOF
-[Service]
-Environment=DB_HOST=127.0.0.1
-Environment=DB_NAME=${DB_NAME}
-Environment=DB_USER=${DB_USER}
-Environment=DB_PASS=${DB_PASS}
-Environment=TARGET_MODE=${MODE}
-EOF
-
-systemctl daemon-reload
-systemctl restart apache2
+chown www-data:www-data "${SITE_DIR}/.env.sample" || true
 
 ### --------------------------
-### Optional: very light iptables guidance (commented out)
+### Start/enable php-fpm & nginx (robust)
 ### --------------------------
-IPT_HINT="/root/iptables.example.sh"
-cat > "$IPT_HINT" <<'BASH'
-#!/usr/bin/env bash
-# Example only. Review before using!
-# iptables -F
-# iptables -P INPUT DROP
-# iptables -P FORWARD DROP
-# iptables -P OUTPUT ACCEPT
-# iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-# iptables -A INPUT -i lo -j ACCEPT
-# iptables -A INPUT -p tcp --dport 80 -j ACCEPT
-# iptables -A INPUT -p tcp --dport 3306 -s 10.0.0.0/8 -j ACCEPT   # tighten as needed
-# iptables -A INPUT -p icmp -j ACCEPT
-BASH
-chmod +x "$IPT_HINT"
+PHP_FPM_SERVICE="php${PHP_VERSION}-fpm"
+# Prefer the exact versioned service; fall back to generic only if needed
+if systemctl list-unit-files --type=service | awk '{print $1}' | grep -qx "${PHP_FPM_SERVICE}.service"; then
+  systemctl_enable_restart_ifexists "${PHP_FPM_SERVICE}"
+else
+  systemctl_enable_restart_ifexists "php-fpm"
+fi
+
+# Ensure nginx starts
+systemctl_enable_restart_ifexists nginx
 
 ### --------------------------
-### Health checks + summary
+### Final checks & guidance
 ### --------------------------
-echo "[*] Verifying services..."
-systemctl is-active --quiet apache2 && echo "Apache: active" || (echo "Apache NOT active"; exit 1)
-systemctl is-active --quiet mariadb && echo "MariaDB: active" || (echo "MariaDB NOT active"; exit 1)
-
 echo
-echo "========== TARGET SETUP COMPLETE =========="
+echo "==== TARGET SETUP COMPLETE ===="
 echo "Mode:            ${MODE}"
 echo "Web root:        ${SITE_DIR}"
-echo "Site URL:        http://$(hostname -I | awk '{print $1}'):${LISTEN_HTTP_PORT}/"
-echo "Sample app:      /app/login.php  and  /app/search.php"
-[[ -n "$PHP_INFO_PAGE_ON" ]] && echo "phpinfo():       /phpinfo.php  (remove in hardening)"
-echo
-echo "Database:        ${DB_NAME}"
+echo "Site URL:        http://$(hostname -I | awk '{print $1}'):${LISTEN_PORT}/"
+echo "DB:              ${DB_NAME}"
 echo "DB user/pass:    ${DB_USER} / ${DB_PASS}"
-echo "DB host:         $( [[ -n "$DB_BIND_ALL" ]] && echo '0.0.0.0 (remote allowed)' || echo '127.0.0.1 (local only)' )"
+echo "php-fpm fastcgi: ${FASTCGI_PASS}"
 echo
-echo "Next steps for students (hardening ideas):"
-echo "  - Remove phpinfo, disable ServerTokens/Signature, scrub X-Powered-By."
-echo "  - Replace string-concat SQL with prepared statements."
-echo "  - Lock MariaDB to 127.0.0.1, rotate DB creds, enforce least privilege."
-echo "  - Tighten file perms, disable directory indexing, add security headers."
-echo "  - Add firewall rules (see ${IPT_HINT})."
-echo "==========================================="
+echo "If nginx failed: run 'nginx -t' then 'journalctl -xeu nginx.service' to inspect details."
+echo
+echo "Teaching/hardening checklist:"
+echo "  - Replace concatenated SQL with prepared statements (in app/*.php)."
+echo "  - Remove phpinfo.php in hardened mode."
+echo "  - Rotate DB credentials; restrict MariaDB to 127.0.0.1 (hardened mode does this)."
+echo "  - Add stricter headers (CSP, HSTS), limit request sizes, tune fastcgi params."
+echo "  - Add firewall rules to limit access to 3306 / 80 as appropriate."
+echo "================================"
