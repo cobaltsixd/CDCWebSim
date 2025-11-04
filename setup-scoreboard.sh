@@ -1,35 +1,47 @@
 #!/bin/bash
 # setup-scoreboard.sh
-# MACCDC-style Scoreboard Service for CDCWebSim
-# Tested on Kali Linux (fresh install, no extra dependencies)
+# MACCDC-style Scoreboard Service for CDCWebSim (Kali Linux, Bash-only)
+# - Serves a simple scoreboard via lighttpd
+# - Stores scores in a flat text file
+# - Auto-detects port conflicts (keeps nginx on :80, moves lighttpd to :8080)
+# - Idempotent: safe to re-run
 
-set -e
+set -euo pipefail
 
+# -------------------------
+# Configurable paths
+# -------------------------
 SCOREBOARD_DIR="/opt/scoreboard"
 WEBROOT="${SCOREBOARD_DIR}/www"
 DATA_FILE="${SCOREBOARD_DIR}/score.db"
-SERVICE_FILE="/etc/systemd/system/scoreboard.service"
+SCRIPTS_DIR="${SCOREBOARD_DIR}/scripts"
+LIGHTTPD_CONF="/etc/lighttpd/lighttpd.conf"
+LIGHTTPD_USER="www-data"
+CRON_LINE="* * * * * ${SCRIPTS_DIR}/update_scoreboard.sh >/dev/null 2>&1"
 
 echo "[*] Setting up Scoreboard..."
 
-# --- Install lighttpd if missing ---
+# -------------------------
+# Ensure lighttpd present
+# -------------------------
 if ! command -v lighttpd >/dev/null 2>&1; then
   echo "[*] Installing lighttpd..."
   apt update -y && apt install -y lighttpd
 fi
 
-# --- Create directories ---
-mkdir -p "${WEBROOT}"
-mkdir -p "${SCOREBOARD_DIR}/scripts"
+# -------------------------
+# Create directories/files
+# -------------------------
+mkdir -p "${WEBROOT}" "${SCRIPTS_DIR}"
 
-# --- Create score database (flat text file) ---
+# Data file
 if [ ! -f "${DATA_FILE}" ]; then
   echo "team,uptime,attacks_blocked,flags_captured,last_update" > "${DATA_FILE}"
   echo "BlueTeam,0,0,0,$(date '+%Y-%m-%d %H:%M:%S')" >> "${DATA_FILE}"
 fi
 
-# --- Create HTML scoreboard page ---
-cat <<'EOF' > "${WEBROOT}/index.html"
+# HTML template
+cat > "${WEBROOT}/index.html" <<'EOF'
 <!DOCTYPE html>
 <html>
 <head>
@@ -40,6 +52,7 @@ cat <<'EOF' > "${WEBROOT}/index.html"
     h1 { color: #0f0; }
     table { margin: 20px auto; border-collapse: collapse; }
     td, th { border: 1px solid #0f0; padding: 6px 12px; }
+    .note { color: #8f8; margin-top: 10px; }
   </style>
 </head>
 <body>
@@ -48,68 +61,160 @@ cat <<'EOF' > "${WEBROOT}/index.html"
     <tr><th>Team</th><th>Uptime (min)</th><th>Attacks Blocked</th><th>Flags Captured</th><th>Last Update</th></tr>
     <!--DATA-->
   </table>
-  <p>Auto-refreshes every 10 seconds</p>
+  <div class="note">Auto-refreshes every 10 seconds</div>
 </body>
 </html>
 EOF
 
-# --- Script to regenerate scoreboard table from score.db ---
-cat <<'EOF' > "${SCOREBOARD_DIR}/scripts/update_scoreboard.sh"
+# -------------------------
+# Render helper scripts
+# -------------------------
+
+# Renders table rows from score.db into index.html
+cat > "${SCRIPTS_DIR}/update_scoreboard.sh" <<'EOF'
 #!/bin/bash
+set -euo pipefail
 DATA_FILE="/opt/scoreboard/score.db"
 HTML_FILE="/opt/scoreboard/www/index.html"
 
-TMP="/tmp/score.tmp"
-TABLE=$(awk -F, 'NR>1 {printf "<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>\n", $1,$2,$3,$4,$5}' "${DATA_FILE}")
+TMP="$(mktemp)"
+TABLE="$(awk -F, 'NR>1 {printf "<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>\n", $1,$2,$3,$4,$5}' "${DATA_FILE}")"
 
+# Replace marker in HTML
 awk -v table="${TABLE}" '{gsub("<!--DATA-->", table)}1' "${HTML_FILE}" > "${TMP}"
-mv "${TMP}" "${HTML_FILE}"
+cat "${TMP}" > "${HTML_FILE}"
+rm -f "${TMP}"
 EOF
-chmod +x "${SCOREBOARD_DIR}/scripts/update_scoreboard.sh"
+chmod +x "${SCRIPTS_DIR}/update_scoreboard.sh"
 
-# --- Cron job for refreshing scoreboard ---
-if ! crontab -l | grep -q "update_scoreboard.sh"; then
-  (crontab -l 2>/dev/null; echo "* * * * * /opt/scoreboard/scripts/update_scoreboard.sh >/dev/null 2>&1") | crontab -
-fi
-
-# --- Lighttpd configuration ---
-LIGHTTPD_CONF="/etc/lighttpd/lighttpd.conf"
-if ! grep -q "${WEBROOT}" "$LIGHTTPD_CONF"; then
-  echo "[*] Updating lighttpd root to ${WEBROOT}"
-  sed -i "s|server.document-root.*|server.document-root = \"${WEBROOT}\"|" "$LIGHTTPD_CONF"
-fi
-
-systemctl enable lighttpd
-systemctl restart lighttpd
-
-# --- Optional: create updater service for scoring events ---
-cat <<'EOF' > "${SCOREBOARD_DIR}/scripts/add_score.sh"
+# Increments a team's counters and re-renders
+cat > "${SCRIPTS_DIR}/add_score.sh" <<'EOF'
 #!/bin/bash
-# add_score.sh <team> <uptime+> <blocks+> <flags+>
+# Usage: add_score.sh <team> <uptime+> <blocks+> <flags+>
+set -euo pipefail
 DATA_FILE="/opt/scoreboard/score.db"
-TEAM=$1; UP=$2; BL=$3; FL=$4
-if [ -z "$TEAM" ]; then echo "Usage: $0 <team> <uptime+> <blocks+> <flags+>"; exit 1; fi
 
-LINE=$(grep "^$TEAM," "$DATA_FILE" || true)
-if [ -z "$LINE" ]; then
-  echo "$TEAM,0,0,0,$(date '+%Y-%m-%d %H:%M:%S')" >> "$DATA_FILE"
-  LINE=$(grep "^$TEAM," "$DATA_FILE")
+TEAM="${1:-}"
+UP="${2:-0}"
+BL="${3:-0}"
+FL="${4:-0}"
+
+if [ -z "$TEAM" ]; then
+  echo "Usage: $0 <team> <uptime+> <blocks+> <flags+>"
+  exit 1
 fi
 
-IFS=',' read -r T U B F D <<< "$LINE"
-U=$((U + UP))
-B=$((B + BL))
-F=$((F + FL))
-D=$(date '+%Y-%m-%d %H:%M:%S')
+# Ensure team exists (create if needed)
+if ! grep -q "^${TEAM}," "$DATA_FILE"; then
+  echo "${TEAM},0,0,0,$(date '+%Y-%m-%d %H:%M:%S')" >> "$DATA_FILE"
+fi
 
-grep -v "^$TEAM," "$DATA_FILE" > /tmp/scores.tmp
-echo "$TEAM,$U,$B,$F,$D" >> /tmp/scores.tmp
-mv /tmp/scores.tmp "$DATA_FILE"
+# Read existing line
+LINE="$(grep "^${TEAM}," "$DATA_FILE")"
+IFS=',' read -r _TEAM U B F D <<< "$LINE"
+
+# Safe arithmetic (default to zero if empty)
+U=$(( ${U:-0} + ${UP:-0} ))
+B=$(( ${B:-0} + ${BL:-0} ))
+F=$(( ${F:-0} + ${FL:-0} ))
+D="$(date '+%Y-%m-%d %H:%M:%S')"
+
+# Write back
+grep -v "^${TEAM}," "$DATA_FILE" > "${DATA_FILE}.tmp"
+echo "${TEAM},${U},${B},${F},${D}" >> "${DATA_FILE}.tmp"
+mv "${DATA_FILE}.tmp" "$DATA_FILE"
+
 /opt/scoreboard/scripts/update_scoreboard.sh
 EOF
-chmod +x "${SCOREBOARD_DIR}/scripts/add_score.sh"
+chmod +x "${SCRIPTS_DIR}/add_score.sh"
 
-echo "[*] Scoreboard installed successfully."
-echo "[*] Access it at: http://localhost/"
-echo "[*] Use add_score.sh to adjust scores. Example:"
-echo "    /opt/scoreboard/scripts/add_score.sh BlueTeam 5 1 0"
+# -------------------------
+# Cron: refresh scoreboard every minute
+# -------------------------
+# Add once (if not present)
+( crontab -l 2>/dev/null | grep -v -F "${SCRIPTS_DIR}/update_scoreboard.sh" || true
+  echo "${CRON_LINE}"
+) | crontab -
+
+# Render once immediately
+"${SCRIPTS_DIR}/update_scoreboard.sh"
+
+# -------------------------
+# Configure lighttpd
+# -------------------------
+
+# Backup config once per run
+if [ -f "${LIGHTTPD_CONF}" ]; then
+  cp -a "${LIGHTTPD_CONF}" "${LIGHTTPD_CONF}.bak.$(date +%s)"
+fi
+
+# Ensure document-root points to our WEBROOT (replace if present, else append)
+if grep -qE '^\s*server\.document-root' "${LIGHTTPD_CONF}"; then
+  sed -i "s@^\s*server\.document-root.*@server.document-root = \"${WEBROOT}\"@" "${LIGHTTPD_CONF}"
+else
+  printf '\nserver.document-root = "%s"\n' "${WEBROOT}" >> "${LIGHTTPD_CONF}"
+fi
+
+# If port 80 is taken (e.g., nginx), switch lighttpd to 8080
+PORT_IN_USE="$(ss -tln | awk '$4 ~ /:80$/ {print $4}' || true)"
+if [ -n "${PORT_IN_USE}" ]; then
+  echo "[*] Port 80 is in use (likely nginx). Setting lighttpd to port 8080."
+  if grep -qE '^\s*server\.port' "${LIGHTTPD_CONF}"; then
+    sed -i 's/^\s*server\.port.*/server.port = 8080/' "${LIGHTTPD_CONF}"
+  else
+    printf '\nserver.port = 8080\n' >> "${LIGHTTPD_CONF}"
+  fi
+  SCOREBOARD_URL="http://localhost:8080/"
+else
+  # Keep/default to port 80
+  if grep -qE '^\s*server\.port' "${LIGHTTPD_CONF}"; then
+    sed -i 's/^\s*server\.port.*/server.port = 80/' "${LIGHTTPD_CONF}"
+  else
+    printf '\nserver.port = 80\n' >> "${LIGHTTPD_CONF}"
+  fi
+  SCOREBOARD_URL="http://localhost/"
+fi
+
+# -------------------------
+# Permissions for web server
+# -------------------------
+chown -R "${LIGHTTPD_USER}:${LIGHTTPD_USER}" "${SCOREBOARD_DIR}"
+chmod -R 755 "${SCOREBOARD_DIR}"
+
+# -------------------------
+# Validate & (re)start service
+# -------------------------
+echo "[*] Testing lighttpd config..."
+lighttpd -t -f "${LIGHTTPD_CONF}"
+
+echo "[*] Enabling and restarting lighttpd..."
+systemctl enable lighttpd >/dev/null 2>&1 || true
+systemctl restart lighttpd
+
+# -------------------------
+# Final checks & output
+# -------------------------
+echo "[*] lighttpd status:"
+systemctl --no-pager --full status lighttpd || true
+
+echo "[*] Listening sockets on :80 or :8080:"
+(ss -tlnp | grep -E ':80\b|:8080\b') || true
+
+echo
+echo "[*] Scoreboard installed."
+echo "    Data file: ${DATA_FILE}"
+echo "    Add score: ${SCRIPTS_DIR}/add_score.sh BlueTeam 5 1 0"
+echo "    View at  : ${SCOREBOARD_URL}"
+echo
+echo "[*] If you want nginx to serve it at /scoreboard, add this to your nginx server block and reload nginx:"
+cat <<'NGINX_HINT'
+
+location /scoreboard/ {
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_pass http://127.0.0.1:8080/;
+}
+# then run:
+#   nginx -t && systemctl reload nginx
+NGINX_HINT
