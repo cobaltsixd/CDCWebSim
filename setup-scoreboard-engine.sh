@@ -1,120 +1,93 @@
 #!/bin/bash
 # setup-scoreboard-engine.sh
-# Installs the automatic scoring framework (detectors, engine, simulated takedown)
-# - Reuses existing scoreboard at /opt/scoreboard
-# - Bash-only, idempotent, safe: NO offensive/exploit code
-# - Requires root. Run: sudo ./setup-scoreboard-engine.sh
-#
-# Safety: this may STOP whitelisted services locally as a *simulation*. Only run in an isolated lab VM.
-
+# Automatic scoring engine (detectors + engine + safe simulated takedown)
+# Plugs into /opt/scoreboard created by setup-scoreboard.sh
 set -euo pipefail
 
-### Sanity: must be root
-if [ "$(id -u)" -ne 0 ]; then
-  echo "ERROR: must be run as root. Use sudo." >&2
-  exit 2
-fi
+echo "[*] Setting up Scoreboard engine..."
 
-########################
-# Paths & vars
-########################
-POLICY="/etc/scoreboard-policy.conf"
-ENG_DIR="/opt/scoreboard/engine"
+SCOREBOARD_DIR="/opt/scoreboard"
+ENG_DIR="${SCOREBOARD_DIR}/engine"
 EVENT_DIR="${ENG_DIR}/events"
 LOG="/var/log/scoreboard-engine.log"
-SCORE_SCRIPT="/opt/scoreboard/scripts/add_score.sh"
-UPDATE_SCRIPT="/opt/scoreboard/scripts/update_scoreboard.sh"
+POLICY="/etc/scoreboard-policy.conf"
 SERVICE_UNIT="/etc/systemd/system/scoreboard-engine.service"
 TIMER_UNIT="/etc/systemd/system/scoreboard-engine.timer"
+SCORE_SCRIPT="/opt/scoreboard/scripts/add_score.sh"
+UPDATE_SCRIPT="/opt/scoreboard/scripts/update_scoreboard.sh"
 
-# Ensure scoreboard exists (we'll continue but warn)
-if [ ! -d "/opt/scoreboard" ]; then
-  echo "WARNING: /opt/scoreboard not found. The engine integrates with /opt/scoreboard/scripts/add_score.sh and update_scoreboard.sh."
-  echo "Make sure the scoreboard is installed and scripts exist before relying on automated scoring."
-fi
+# --- sanity: scoreboard should exist (we'll proceed anyway) ---
+mkdir -p "${ENG_DIR}" "${EVENT_DIR}"
+touch "${LOG}"
 
-########################
-# 1) Policy file
-########################
-cat > "${POLICY}" <<'EOF'
-# /etc/scoreboard-policy.conf
-# thresholds and whitelists
-SSH_FAIL_THRESHOLD=5        # failed auths in window
-SSH_FAIL_WINDOW_MIN=5       # minutes
-# space-separated systemd service names that simulation may stop
-SERVICE_WHITELIST="apache2 mysql lighttpd httpd"
-SIM_TAKEDOWN_AFTER_MIN=10   # minutes vuln persists before simulated takedown
+# --- policy (create if missing) ---
+if [ ! -f "${POLICY}" ]; then
+  cat > "${POLICY}" <<'EOF'
+SSH_FAIL_THRESHOLD=5
+SSH_FAIL_WINDOW_MIN=5
+SERVICE_WHITELIST="lighttpd mariadb"
+SIM_TAKEDOWN_AFTER_MIN=10
 POINTS_SSH_BRUTE=1
 POINTS_SERVICE_DOWN=5
 POINTS_BLOCKED=1
 EOF
+fi
 chmod 644 "${POLICY}"
-echo "[+] Wrote policy -> ${POLICY}"
 
-########################
-# 2) Engine directory & basic files
-########################
-mkdir -p "${ENG_DIR}" "${EVENT_DIR}"
-touch "${LOG}"
-chown -R root:root "${ENG_DIR}"
-chmod 755 "${ENG_DIR}"
-chmod 755 "${EVENT_DIR}"
-chmod 644 "${LOG}"
-echo "[+] Engine directories created: ${ENG_DIR} , ${EVENT_DIR}"
+# --- auto-detect installed services and rewrite whitelist ---
+CANDIDATES="lighttpd nginx apache2 httpd mariadb mysql php-fpm postgresql"
+FOUND=()
+for s in $CANDIDATES; do systemctl status "$s" >/dev/null 2>&1 && FOUND+=("$s"); done
+[ "${#FOUND[@]}" -eq 0 ] && FOUND=("lighttpd")
+awk -v list="${FOUND[*]}" '
+  BEGIN {done=0}
+  /^SERVICE_WHITELIST=/ {print "SERVICE_WHITELIST=\"" list "\""; done=1; next}
+  {print}
+  END {if(!done) print "SERVICE_WHITELIST=\"" list "\""}
+' "${POLICY}" > "${POLICY}.new" && mv "${POLICY}.new" "${POLICY}"
 
-########################
-# 3) service_check.sh
-########################
+# --- detectors ---
 cat > "${ENG_DIR}/service_check.sh" <<'EOF'
 #!/bin/bash
-# service_check.sh - checks systemd services in whitelist and writes events
+set -euo pipefail
 POLICY="/etc/scoreboard-policy.conf"
 LOG="/var/log/scoreboard-engine.log"
 EVENT_DIR="/opt/scoreboard/engine/events"
 mkdir -p "$EVENT_DIR"
-source "$POLICY"
+. "$POLICY"
 
 now=$(date +%s)
 for svc in $SERVICE_WHITELIST; do
-  if systemctl is-active --quiet "$svc"; then
-    echo "$(date -Is) SERVICE_OK $svc" >> "$LOG"
-  else
-    echo "$(date -Is) SERVICE_DOWN $svc" >> "$LOG"
-    printf '{"time":%s,"type":"SERVICE_DOWN","service":"%s"}\n' "$now" "$svc" > "$EVENT_DIR/service_down_${svc}_${now}.evt"
+  if systemctl status "$svc" >/dev/null 2>&1; then
+    if systemctl is-active --quiet "$svc"; then
+      echo "$(date -Is) SERVICE_OK $svc" >> "$LOG"
+    else
+      echo "$(date -Is) SERVICE_DOWN $svc" >> "$LOG"
+      printf '{"time":%s,"type":"SERVICE_DOWN","service":"%s"}\n' "$now" "$svc" > "$EVENT_DIR/service_down_${svc}_${now}.evt"
+    fi
   fi
 done
 EOF
-chmod 755 "${ENG_DIR}/service_check.sh"
-echo "[+] Installed service_check.sh"
+chmod +x "${ENG_DIR}/service_check.sh"
 
-########################
-# 4) ssh_fail_detector.sh
-########################
 cat > "${ENG_DIR}/ssh_fail_detector.sh" <<'EOF'
 #!/bin/bash
-# ssh_fail_detector.sh - count SSH failures in last N minutes and raise event
+set -euo pipefail
 POLICY="/etc/scoreboard-policy.conf"
 LOG="/var/log/scoreboard-engine.log"
 EVENT_DIR="/opt/scoreboard/engine/events"
 mkdir -p "$EVENT_DIR"
-source "$POLICY"
+. "$POLICY"
 
 FAILS=0
-# Try journalctl for typical systemd systems (sshd or ssh unit)
 if command -v journalctl >/dev/null 2>&1; then
-  # try both common unit names
   FAILS=$(journalctl -u sshd -S "-${SSH_FAIL_WINDOW_MIN}m" -o short-iso 2>/dev/null | grep -E "Failed password" | wc -l || true)
   if [ -z "$FAILS" ] || [ "$FAILS" -eq 0 ]; then
     FAILS=$(journalctl -u ssh -S "-${SSH_FAIL_WINDOW_MIN}m" -o short-iso 2>/dev/null | grep -E "Failed password" | wc -l || true)
   fi
 fi
-
-# fallback to /var/log/auth.log (Debian-based)
 if [ -z "$FAILS" ] || [ "$FAILS" -eq 0 ]; then
-  if [ -f /var/log/auth.log ]; then
-    # crude best-effort: count "Failed password" in last ~500 lines
-    FAILS=$(grep "Failed password" /var/log/auth.log 2>/dev/null | tail -n 500 | wc -l || true)
-  fi
+  [ -f /var/log/auth.log ] && FAILS=$(grep "Failed password" /var/log/auth.log 2>/dev/null | tail -n 500 | wc -l || true)
 fi
 
 if [ -n "$FAILS" ] && [ "$FAILS" -ge "$SSH_FAIL_THRESHOLD" ]; then
@@ -123,112 +96,94 @@ if [ -n "$FAILS" ] && [ "$FAILS" -ge "$SSH_FAIL_THRESHOLD" ]; then
   printf '{"time":%s,"type":"SSH_BRUTE","fails":%s}\n' "$now" "$FAILS" > "${EVENT_DIR}/ssh_brute_${now}.evt"
 fi
 EOF
-chmod 755 "${ENG_DIR}/ssh_fail_detector.sh"
-echo "[+] Installed ssh_fail_detector.sh"
+chmod +x "${ENG_DIR}/ssh_fail_detector.sh"
 
-########################
-# 5) simulate_takedown.sh (safe, whitelisted)
-########################
+# --- safe simulated takedown / restore ---
 cat > "${ENG_DIR}/simulate_takedown.sh" <<'EOF'
 #!/bin/bash
-# simulate_takedown.sh - safely stop a whitelisted service after policy trigger
+set -euo pipefail
 POLICY="/etc/scoreboard-policy.conf"
 LOG="/var/log/scoreboard-engine.log"
-source "$POLICY"
-svc="$1"
-if [ -z "$svc" ]; then
-  echo "Usage: $0 <service>" >&2; exit 2
-fi
-allowed=0
-for s in $SERVICE_WHITELIST; do
-  [ "$s" = "$svc" ] && allowed=1 && break
-done
-if [ $allowed -ne 1 ]; then
-  echo "$(date -Is): Attempt to simulate takedown of non-whitelisted $svc" >> "$LOG"
-  exit 3
-fi
+. "$POLICY"
+svc="${1:-}"
+[ -n "$svc" ] || { echo "Usage: $0 <service>"; exit 2; }
+allowed=0; for s in $SERVICE_WHITELIST; do [ "$s" = "$svc" ] && allowed=1 && break; done
+[ $allowed -eq 1 ] || { echo "$(date -Is): non-whitelisted takedown $svc" >> "$LOG"; exit 3; }
 echo "$(date -Is): Simulating takedown of $svc" >> "$LOG"
-# record enablement state (best-effort), then stop & disable
 if systemctl is-enabled "$svc" >/dev/null 2>&1; then
-  systemctl disable "$svc" >/dev/null 2>&1 || true
   echo "$svc enabled" >> /opt/scoreboard/engine/takedown_markers
+  systemctl disable "$svc" >/dev/null 2>&1 || true
 else
   echo "$svc disabled" >> /opt/scoreboard/engine/takedown_markers
 fi
 systemctl stop "$svc" >/dev/null 2>&1 || true
 EOF
-chmod 755 "${ENG_DIR}/simulate_takedown.sh"
-echo "[+] Installed simulate_takedown.sh"
+chmod +x "${ENG_DIR}/simulate_takedown.sh"
 
-########################
-# 6) restore_services.sh
-########################
 cat > "${ENG_DIR}/restore_services.sh" <<'EOF'
 #!/bin/bash
+set -euo pipefail
 LOG="/var/log/scoreboard-engine.log"
 MARKER="/opt/scoreboard/engine/takedown_markers"
-[ -f "$MARKER" ] || { echo "No takedown markers to restore"; exit 0; }
+[ -f "$MARKER" ] || { echo "No takedown markers"; exit 0; }
 while read -r svc state; do
-  echo "$(date -Is): Restoring $svc (previous state: $state)" >> "$LOG"
+  echo "$(date -Is): Restoring $svc (was $state)" >> "$LOG"
   systemctl start "$svc" >/dev/null 2>&1 || true
-  if [ "$state" = "enabled" ]; then
-    systemctl enable "$svc" >/dev/null 2>&1 || true
-  fi
+  [ "$state" = "enabled" ] && systemctl enable "$svc" >/dev/null 2>&1 || true
 done < "$MARKER"
 rm -f "$MARKER"
 EOF
-chmod 755 "${ENG_DIR}/restore_services.sh"
-echo "[+] Installed restore_services.sh"
+chmod +x "${ENG_DIR}/restore_services.sh"
 
-########################
-# 7) score_engine.sh (main consumer)
-########################
+# --- engine (robust; Blue uptime on existing services only) ---
 cat > "${ENG_DIR}/score_engine.sh" <<'EOF'
 #!/bin/bash
-# score_engine.sh - main runner: consumes events, awards points, triggers takedown
+set -euo pipefail
 EVENT_DIR="/opt/scoreboard/engine/events"
 LOG="/var/log/scoreboard-engine.log"
 POLICY="/etc/scoreboard-policy.conf"
 SCORE_SCRIPT="/opt/scoreboard/scripts/add_score.sh"
 SIM_SCRIPT="/opt/scoreboard/engine/simulate_takedown.sh"
-source "$POLICY"
-mkdir -p "$EVENT_DIR"
+UPDATE_SCRIPT="/opt/scoreboard/scripts/update_scoreboard.sh"
+[ -f "$POLICY" ] && . "$POLICY" || {
+  SSH_FAIL_THRESHOLD=5; SSH_FAIL_WINDOW_MIN=5; SERVICE_WHITELIST="lighttpd mariadb"
+  SIM_TAKEDOWN_AFTER_MIN=10; POINTS_SSH_BRUTE=1; POINTS_SERVICE_DOWN=5; POINTS_BLOCKED=1; }
+mkdir -p "$EVENT_DIR"; touch "$LOG"
+log(){ echo "$(date -Is) $*" >> "$LOG"; }
 
-# process event files
+# consume events
 for evt in "$EVENT_DIR"/*.evt; do
   [ -e "$evt" ] || continue
   payload=$(cat "$evt")
-  type=$(echo "$payload" | sed -n 's/.*"type":"\([^"]*\)".*/\1/p')
+  type=$(echo "$payload" | sed -n 's/.*"type":"\([^"]*\)".*/\1/p' || true)
   case "$type" in
     SSH_BRUTE)
-      fails=$(echo "$payload" | sed -n 's/.*"fails":\([0-9]*\).*/\1/p')
-      echo "$(date -Is): SSH brute detected, fails=$fails" >> "$LOG"
-      # award red team flag points (configurable)
-      $SCORE_SCRIPT RedTeam 0 0 $POINTS_SSH_BRUTE >/dev/null 2>&1 || true
+      fails=$(echo "$payload" | sed -n 's/.*"fails":\([0-9]*\).*/\1/p' || echo 0)
+      log "SSH brute detected fails=$fails"
+      [ -x "$SCORE_SCRIPT" ] && "$SCORE_SCRIPT" RedTeam 0 0 "$POINTS_SSH_BRUTE" >/dev/null 2>&1 || true
       ;;
     SERVICE_DOWN)
-      svc=$(echo "$payload" | sed -n 's/.*"service":"\([^"]*\)".*/\1/p')
-      echo "$(date -Is): Service down detected: $svc" >> "$LOG"
-      $SCORE_SCRIPT RedTeam 0 0 $POINTS_SERVICE_DOWN >/dev/null 2>&1 || true
-      # persist for potential simulated takedown
+      svc=$(echo "$payload" | sed -n 's/.*"service":"\([^"]*\)".*/\1/p' || true)
+      log "Service down: $svc"
+      [ -x "$SCORE_SCRIPT" ] && "$SCORE_SCRIPT" RedTeam 0 0 "$POINTS_SERVICE_DOWN" >/dev/null 2>&1 || true
       echo "$svc $(date +%s)" >> /opt/scoreboard/engine/down_persist
       ;;
     *)
-      echo "$(date -Is): Unknown event: $payload" >> "$LOG"
+      log "Unknown event: $payload"
       ;;
   esac
   rm -f "$evt"
 done
 
-# handle persisted downs - if older than threshold, simulate takedown
+# simulate takedown after persistence threshold
 if [ -f /opt/scoreboard/engine/down_persist ]; then
-  TMP="/opt/scoreboard/engine/down_persist.tmp.$$"
-  > "$TMP"
+  TMP="/opt/scoreboard/engine/down_persist.tmp.$$"; >"$TMP"
   while read -r svc ts; do
+    [ -n "$svc" ] || continue
     age_min=$(( ( $(date +%s) - ts ) / 60 ))
-    if [ "$age_min" -ge "$SIM_TAKEDOWN_AFTER_MIN" ]; then
-      $SIM_SCRIPT "$svc" >/dev/null 2>&1 || true
-      $SCORE_SCRIPT RedTeam 0 0 $POINTS_SERVICE_DOWN >/dev/null 2>&1 || true
+    if [ "$age_min" -ge "${SIM_TAKEDOWN_AFTER_MIN:-10}" ]; then
+      [ -x "$SIM_SCRIPT" ] && "$SIM_SCRIPT" "$svc" >/dev/null 2>&1 || log "simulate_takedown failed $svc"
+      [ -x "$SCORE_SCRIPT" ] && "$SCORE_SCRIPT" RedTeam 0 0 "${POINTS_SERVICE_DOWN:-5}" >/dev/null 2>&1 || true
     else
       echo "$svc $ts" >> "$TMP"
     fi
@@ -236,36 +191,40 @@ if [ -f /opt/scoreboard/engine/down_persist ]; then
   mv "$TMP" /opt/scoreboard/engine/down_persist
 fi
 
-# Optionally: auto-award BlueTeam uptime if services healthy (simple heuristic)
-# If most services in whitelist are active, give BlueTeam +1 uptime per run
-active_count=0; total_count=0
+# Blue uptime: consider only services that exist
+active=0; total=0
 for s in $SERVICE_WHITELIST; do
-  total_count=$((total_count+1))
-  if systemctl is-active --quiet "$s"; then active_count=$((active_count+1)); fi
+  if systemctl status "$s" >/dev/null 2>&1; then
+    total=$((total+1))
+    systemctl is-active --quiet "$s" && active=$((active+1))
+  fi
 done
-# require >50% up to award uptime
-if [ "$total_count" -gt 0 ] && [ "$active_count" -gt $(( total_count / 2 )) ]; then
-  $SCORE_SCRIPT BlueTeam 1 0 0 >/dev/null 2>&1 || true
+if [ "$total" -gt 0 ]; then
+  majority=$(( (total + 1) / 2 ))
+  if [ "$active" -ge "$majority" ]; then
+    [ -x "$SCORE_SCRIPT" ] && "$SCORE_SCRIPT" BlueTeam 1 0 0 >/dev/null 2>&1 || true
+    log "Blue +1 uptime (active=$active/total=$total)"
+  else
+    log "Blue uptime not awarded (active=$active/total=$total)"
+  fi
+else
+  log "No existing services from whitelist; skip Blue uptime"
 fi
 
-# Render scoreboard (if existing update script)
-if [ -x "$UPDATE_SCRIPT" ]; then
-  $UPDATE_SCRIPT >/dev/null 2>&1 || true
-fi
+[ -x "$UPDATE_SCRIPT" ] && "$UPDATE_SCRIPT" >/dev/null 2>&1 || true
+exit 0
 EOF
-chmod 755 "${ENG_DIR}/score_engine.sh"
-echo "[+] Installed score_engine.sh"
+chmod +x "${ENG_DIR}/score_engine.sh"
 
-########################
-# 8) Ensure ownership & perms are sane
-########################
-chown -R root:root "${ENG_DIR}"
-chmod -R 755 "${ENG_DIR}"
+# --- sanitize endings and ensure shebang/exec for all engine scripts ---
+for f in "${ENG_DIR}"/*.sh; do
+  sed -i 's/\r$//' "$f"
+  grep -q '^#!' "$f" || sed -i '1i #!/bin/bash' "$f"
+  chmod +x "$f"
+done
 chmod 644 "${LOG}" || true
 
-########################
-# 9) systemd service + timer
-########################
+# --- systemd service + timer ---
 cat > "${SERVICE_UNIT}" <<'EOF'
 [Unit]
 Description=Scoreboard engine runner (detectors + engine)
@@ -297,35 +256,13 @@ EOF
 
 systemctl daemon-reload
 systemctl enable --now scoreboard-engine.timer
-echo "[+] Installed and started scoreboard-engine.timer (runs detectors+engine every minute)"
-
-########################
-# 10) initial run & smoke tests
-########################
-echo "[*] Running one manual iteration for smoke test..."
-/opt/scoreboard/engine/ssh_fail_detector.sh || true
-/opt/scoreboard/engine/service_check.sh || true
-/opt/scoreboard/engine/score_engine.sh || true
+systemctl restart scoreboard-engine.service || true
 
 echo
-echo "=== quick checks ==="
-systemctl --no-pager status scoreboard-engine.timer || true
-journalctl -u scoreboard-engine.timer -n 50 --no-pager || true
-echo "Events dir: $(ls -la ${EVENT_DIR} || true)"
-echo "Engine log tail:"
-tail -n 40 "${LOG}" || true
-
-# show current scoreboard if available and web server on 8080
-if command -v curl >/dev/null 2>&1; then
-  echo
-  echo "Attempting to fetch scoreboard page (127.0.0.1:8080):"
-  curl -sS --max-time 5 http://127.0.0.1:8080/ | sed -n '1,40p' || echo "(no response on 8080)"
-fi
-
+echo "[✓] Scoreboard engine installed."
+echo "    Policy:   ${POLICY}"
+echo "    Events:   ${EVENT_DIR}"
+echo "    Restore:  /opt/scoreboard/engine/restore_services.sh"
+echo "    Timer:    systemctl status scoreboard-engine.timer --no-pager"
 echo
-echo "Installation complete. Review /etc/scoreboard-policy.conf to adjust thresholds and whitelist."
-echo "To restore services after simulated takedown: /opt/scoreboard/engine/restore_services.sh"
-echo "To inspect or replay events, check: ${EVENT_DIR} and ${LOG}"
-echo
-echo "NOTE: This framework only *simulates* takedowns by stopping whitelisted services on the local VM. Do NOT run on production hosts."
-exit 0
+echo "Detected whitelist: $(. ${POLICY}; echo $SERVICE_WHITELIST)"
